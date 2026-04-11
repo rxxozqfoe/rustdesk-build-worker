@@ -1,0 +1,168 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// Client communicates with the rustdesk-api worker endpoints.
+type Client struct {
+	baseURL    string
+	token      string
+	httpClient *http.Client
+}
+
+func New(baseURL, token string) *Client {
+	return &Client{
+		baseURL: baseURL,
+		token:   token,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+// WorkerJob is the task payload from the API server.
+type WorkerJob struct {
+	ID            uint   `json:"id"`
+	Type          string `json:"type"` // "pre-build" or "bundle"
+	Version       string `json:"version,omitempty"`
+	Platform      string `json:"platform"`
+	Arch          string `json:"arch"`
+	Format        string `json:"format,omitempty"`
+	AppName       string `json:"app_name,omitempty"`
+	CustomTxt     string `json:"custom_txt,omitempty"`
+	ArtifactS3Key string `json:"artifact_s3_key,omitempty"`
+	ArtifactDir   string `json:"artifact_dir,omitempty"`
+}
+
+// FetchPendingJob polls for a pending job. Returns nil when no job is available.
+func (c *Client) FetchPendingJob() (*WorkerJob, error) {
+	resp, err := c.doRequest("GET", "/api/worker/jobs/pending", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent {
+		return nil, nil
+	}
+
+	r, err := decodeResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	var job WorkerJob
+	if err := json.Unmarshal(r.Data, &job); err != nil {
+		return nil, fmt.Errorf("decode job: %w", err)
+	}
+	return &job, nil
+}
+
+// StartJob reports that a job has started.
+func (c *Client) StartJob(jobID uint, jobType string) error {
+	body := map[string]string{"type": jobType}
+	resp, err := c.doRequest("POST", fmt.Sprintf("/api/worker/jobs/%d/start", jobID), body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// AppendLog sends log content to the API server.
+func (c *Client) AppendLog(jobID uint, content string) error {
+	body := map[string]string{"content": content}
+	resp, err := c.doRequest("POST", fmt.Sprintf("/api/worker/jobs/%d/log", jobID), body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// CompleteJob reports job completion.
+func (c *Client) CompleteJob(jobID uint, jobType, s3Key string, fileSize int64) error {
+	body := map[string]any{
+		"type":      jobType,
+		"s3_key":    s3Key,
+		"file_size": fileSize,
+	}
+	resp, err := c.doRequest("POST", fmt.Sprintf("/api/worker/jobs/%d/complete", jobID), body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// FailJob reports job failure.
+func (c *Client) FailJob(jobID uint, jobType, errMsg string) error {
+	body := map[string]string{
+		"type":  jobType,
+		"error": errMsg,
+	}
+	resp, err := c.doRequest("POST", fmt.Sprintf("/api/worker/jobs/%d/fail", jobID), body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+func (c *Client) doRequest(method, path string, body any) (*http.Response, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshal request: %w", err)
+		}
+		bodyReader = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequest(method, c.baseURL+path, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return resp, nil
+}
+
+// apiResponse is the standard response wrapper from rustdesk-api.
+type apiResponse struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data"`
+}
+
+// decodeResponse checks the API response code and returns the data field.
+func decodeResponse(resp *http.Response) (*apiResponse, error) {
+	var r apiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if r.Code != 0 {
+		return nil, fmt.Errorf("API error (code=%d): %s", r.Code, r.Message)
+	}
+	return &r, nil
+}

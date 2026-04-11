@@ -26,6 +26,12 @@ func New(baseURL, token string) *Client {
 	}
 }
 
+// PlatformConfig describes a platform+arch pair that this worker supports.
+type PlatformConfig struct {
+	Platform string `json:"platform"`
+	Arch     string `json:"arch"`
+}
+
 // WorkerJob is the task payload from the API server.
 type WorkerJob struct {
 	ID            uint   `json:"id"`
@@ -40,9 +46,48 @@ type WorkerJob struct {
 	ArtifactDir   string `json:"artifact_dir,omitempty"`
 }
 
+// Register registers this worker with the API server.
+func (c *Client) Register(name string, platforms any) error {
+	resp, err := c.doRequest("POST", "/api/worker/register", map[string]any{
+		"name": name, "platforms": platforms,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, err = decodeResponse(resp)
+	return err
+}
+
+// Heartbeat sends a heartbeat to the API server.
+func (c *Client) Heartbeat(name string) error {
+	resp, err := c.doRequest("POST", "/api/worker/heartbeat", map[string]string{"name": name})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, err = decodeResponse(resp)
+	return err
+}
+
+// PushVersions pushes the list of available pre-built versions to the API server.
+func (c *Client) PushVersions(name string, versions []string) error {
+	resp, err := c.doRequest("POST", "/api/worker/versions", map[string]any{
+		"name": name, "versions": versions,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, err = decodeResponse(resp)
+	return err
+}
+
 // FetchPendingJob polls for a pending job. Returns nil when no job is available.
-func (c *Client) FetchPendingJob() (*WorkerJob, error) {
-	resp, err := c.doRequest("GET", "/api/worker/jobs/pending", nil)
+func (c *Client) FetchPendingJob(name string, platforms []PlatformConfig) (*WorkerJob, error) {
+	resp, err := c.doRequest("POST", "/api/worker/jobs/pending", map[string]any{
+		"name": name, "platforms": platforms,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -87,11 +132,12 @@ func (c *Client) AppendLog(jobID uint, content string) error {
 }
 
 // CompleteJob reports job completion.
-func (c *Client) CompleteJob(jobID uint, jobType, s3Key string, fileSize int64) error {
+func (c *Client) CompleteJob(jobID uint, jobType, s3Key string, fileSize int64, logS3Key string) error {
 	body := map[string]any{
-		"type":      jobType,
-		"s3_key":    s3Key,
-		"file_size": fileSize,
+		"type":       jobType,
+		"s3_key":     s3Key,
+		"file_size":  fileSize,
+		"log_s3_key": logS3Key,
 	}
 	resp, err := c.doRequest("POST", fmt.Sprintf("/api/worker/jobs/%d/complete", jobID), body)
 	if err != nil {

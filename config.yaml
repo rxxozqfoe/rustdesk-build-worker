@@ -2,6 +2,12 @@ api:
   base-url: "http://rustdesk-api:21114"
   token: "worker-secret-token"
 
+worker:
+  name: "builder-1"
+  platforms:
+    - platform: linux
+      arch: x86_64
+
 s3:
   endpoint: "minio:9000"
   access-key: "minioadmin"
@@ -15,6 +21,3 @@ build:
   worktree-dir: "/tmp/build-worktree"
   log-dir: "/tmp/build-logs"
   signing-public-key: "fjMWQpn+Kvu2hO6hRjIWyS8n55JITpevt0OzMBRIn4Q="
-
-http:
-  addr: ":8080"

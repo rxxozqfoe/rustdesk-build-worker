@@ -2,15 +2,16 @@ package config
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/viper"
 )
 
 type Config struct {
-	API   API   `mapstructure:"api"`
-	S3    S3    `mapstructure:"s3"`
-	Build Build `mapstructure:"build"`
-	HTTP  HTTP  `mapstructure:"http"`
+	API    API            `mapstructure:"api"`
+	S3     S3             `mapstructure:"s3"`
+	Build  Build          `mapstructure:"build"`
+	Worker WorkerIdentity `mapstructure:"worker"`
 }
 
 type API struct {
@@ -34,8 +35,14 @@ type Build struct {
 	SigningPublicKey string `mapstructure:"signing-public-key"` // Ed25519 public key to patch into client
 }
 
-type HTTP struct {
-	Addr string `mapstructure:"addr"` // e.g. ":8080"
+type WorkerIdentity struct {
+	Name      string           `mapstructure:"name"`
+	Platforms []PlatformConfig `mapstructure:"platforms"`
+}
+
+type PlatformConfig struct {
+	Platform string `mapstructure:"platform"`
+	Arch     string `mapstructure:"arch"`
 }
 
 func Load(path string) (*Config, error) {
@@ -43,7 +50,6 @@ func Load(path string) (*Config, error) {
 	v.SetConfigFile(path)
 	v.SetConfigType("yaml")
 
-	v.SetDefault("http.addr", ":8080")
 	v.SetDefault("build.worktree-dir", "/tmp/build-worktree")
 	v.SetDefault("build.log-dir", "/tmp/build-logs")
 
@@ -55,5 +61,11 @@ func Load(path string) (*Config, error) {
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
+
+	if cfg.Worker.Name == "" {
+		hostname, _ := os.Hostname()
+		cfg.Worker.Name = hostname
+	}
+
 	return cfg, nil
 }

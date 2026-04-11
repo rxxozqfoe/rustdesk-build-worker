@@ -39,14 +39,6 @@ func main() {
 	// Worker
 	w := worker.New(cfg, apiClient, s3Client)
 
-	// Start HTTP server for versions/log proxying (in background)
-	go func() {
-		log.Printf("Worker HTTP server starting on %s", cfg.HTTP.Addr)
-		if err := w.ServeHTTP(cfg.HTTP.Addr, cfg.API.Token); err != nil {
-			log.Fatalf("HTTP server failed: %v", err)
-		}
-	}()
-
 	// Start polling loop
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

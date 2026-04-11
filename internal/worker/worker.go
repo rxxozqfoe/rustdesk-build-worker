@@ -42,14 +42,75 @@ func New(cfg *config.Config, apiClient *api.Client, s3Client *s3.Client) *Worker
 	}
 }
 
-// PreBuilder returns the pre-builder for HTTP handlers (versions, log).
-func (w *Worker) PreBuilder() *builder.PreBuilder {
-	return w.preBuilder
+// Run registers the worker, starts background goroutines, and enters the polling loop.
+// Blocks until context is cancelled.
+func (w *Worker) Run(ctx context.Context) {
+	// 1. Register
+	log.Printf("Registering worker %q...", w.cfg.Worker.Name)
+	if err := w.apiClient.Register(w.cfg.Worker.Name, w.cfg.Worker.Platforms); err != nil {
+		log.Fatalf("Failed to register: %v", err)
+	}
+	log.Printf("Registered as %q with platforms: %v", w.cfg.Worker.Name, w.cfg.Worker.Platforms)
+
+	// 2. Push initial versions
+	if versions, err := w.preBuilder.ListVersions(); err == nil && len(versions) > 0 {
+		if err := w.apiClient.PushVersions(w.cfg.Worker.Name, versions); err != nil {
+			log.Printf("Warning: failed to push versions: %v", err)
+		} else {
+			log.Printf("Pushed %d versions", len(versions))
+		}
+	}
+
+	// 3. Start heartbeat goroutine (every 5s, timeout is 15s on API side)
+	go w.heartbeatLoop(ctx)
+
+	// 4. Start version refresh goroutine (every 5 minutes)
+	go w.versionPushLoop(ctx)
+
+	// 5. Polling loop
+	log.Println("Worker polling loop started")
+	w.pollLoop(ctx)
 }
 
-// Run starts the polling loop. Blocks until context is cancelled.
-func (w *Worker) Run(ctx context.Context) {
-	log.Println("Worker polling loop started")
+func (w *Worker) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := w.apiClient.Heartbeat(w.cfg.Worker.Name); err != nil {
+				log.Printf("Heartbeat failed: %v", err)
+			}
+		}
+	}
+}
+
+func (w *Worker) versionPushLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if versions, err := w.preBuilder.ListVersions(); err == nil {
+				w.apiClient.PushVersions(w.cfg.Worker.Name, versions)
+			}
+		}
+	}
+}
+
+func (w *Worker) pollLoop(ctx context.Context) {
+	platforms := make([]api.PlatformConfig, len(w.cfg.Worker.Platforms))
+	for i, p := range w.cfg.Worker.Platforms {
+		platforms[i] = api.PlatformConfig{
+			Platform: p.Platform,
+			Arch:     p.Arch,
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -58,7 +119,7 @@ func (w *Worker) Run(ctx context.Context) {
 		default:
 		}
 
-		job, err := w.apiClient.FetchPendingJob()
+		job, err := w.apiClient.FetchPendingJob(w.cfg.Worker.Name, platforms)
 		if err != nil {
 			log.Printf("Error fetching job: %v", err)
 			time.Sleep(5 * time.Second)
@@ -98,7 +159,7 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 		return
 	}
 
-	// Track log path for HTTP handler and send to API
+	// Send final log content
 	if result.LogPath != "" {
 		w.jobLogs.Store(job.ID, result.LogPath)
 		if logContent, err := os.ReadFile(result.LogPath); err == nil {
@@ -125,8 +186,18 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 		return
 	}
 
+	// Upload log to S3
+	var logS3Key string
+	if result.LogPath != "" {
+		logS3Key = fmt.Sprintf("logs/prebuild-%d.log", job.ID)
+		if _, err := w.s3Client.UploadFile(context.Background(), logS3Key, result.LogPath, "text/plain"); err != nil {
+			log.Printf("Warning: log S3 upload failed: %v", err)
+			logS3Key = "" // don't fail the job for log upload failure
+		}
+	}
+
 	log.Printf("Pre-build completed, S3 key: %s", s3Key)
-	w.apiClient.CompleteJob(job.ID, "pre-build", s3Key, 0)
+	w.apiClient.CompleteJob(job.ID, "pre-build", s3Key, 0, logS3Key)
 }
 
 func (w *Worker) handleBundle(job *api.WorkerJob) {
@@ -201,7 +272,7 @@ func (w *Worker) handleBundle(job *api.WorkerJob) {
 	}
 
 	log.Printf("Bundle completed, S3 key: %s", s3Key)
-	w.apiClient.CompleteJob(job.ID, "bundle", s3Key, result.FileSize)
+	w.apiClient.CompleteJob(job.ID, "bundle", s3Key, result.FileSize, "")
 }
 
 func createTarGz(outputPath, sourceDir string) error {

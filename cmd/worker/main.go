@@ -7,27 +7,34 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/spf13/cobra"
+
 	"github.com/nicholaswilde/rustdesk-build-worker/internal/api"
 	"github.com/nicholaswilde/rustdesk-build-worker/internal/config"
 	"github.com/nicholaswilde/rustdesk-build-worker/internal/s3"
 	"github.com/nicholaswilde/rustdesk-build-worker/internal/worker"
 )
 
-func main() {
-	configPath := "config.yaml"
-	if len(os.Args) > 1 {
-		configPath = os.Args[1]
-	}
+var configPath string
 
+var rootCmd = &cobra.Command{
+	Use:   "build-worker",
+	Short: "RustDesk build worker — compiles and packages custom clients",
+	Run:   run,
+}
+
+func init() {
+	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "config.yaml", "path to config file")
+}
+
+func run(cmd *cobra.Command, args []string) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// API client
 	apiClient := api.New(cfg.API.BaseURL, cfg.API.Token)
 
-	// S3 client
 	s3Client, err := s3.New(&cfg.S3)
 	if err != nil {
 		log.Fatalf("Failed to create S3 client: %v", err)
@@ -36,14 +43,11 @@ func main() {
 		log.Printf("Warning: S3 bucket check failed: %v", err)
 	}
 
-	// Worker
 	w := worker.New(cfg, apiClient, s3Client)
 
-	// Start polling loop
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -53,4 +57,10 @@ func main() {
 	}()
 
 	w.Run(ctx)
+}
+
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
 }

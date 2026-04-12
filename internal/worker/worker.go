@@ -144,6 +144,53 @@ func (w *Worker) pollLoop(ctx context.Context) {
 	}
 }
 
+// streamLog tails a log file and pushes incremental content to the API every 3 seconds.
+// Also checks for job cancellation. Returns a cancel function and a channel
+// that receives true if the job was cancelled.
+func (w *Worker) streamLog(jobID uint, jobType, logPath string) (context.CancelFunc, <-chan bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelledCh := make(chan bool, 1)
+	go func() {
+		var offset int64
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				// Final flush
+				w.pushLogIncrement(jobID, logPath, &offset)
+				return
+			case <-ticker.C:
+				w.pushLogIncrement(jobID, logPath, &offset)
+				// Check if job was cancelled
+				if w.apiClient.IsJobCancelled(jobID, jobType) {
+					cancelledCh <- true
+					return
+				}
+			}
+		}
+	}()
+	return cancel, cancelledCh
+}
+
+func (w *Worker) pushLogIncrement(jobID uint, logPath string, offset *int64) {
+	f, err := os.Open(logPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	if *offset > 0 {
+		f.Seek(*offset, io.SeekStart)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil || len(data) == 0 {
+		return
+	}
+	*offset += int64(len(data))
+	w.apiClient.AppendLog(jobID, string(data))
+}
+
 func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 	if err := w.apiClient.StartJob(job.ID, "pre-build"); err != nil {
 		log.Printf("Failed to start job %d: %v", job.ID, err)
@@ -152,21 +199,77 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 
 	pubKey := w.cfg.Build.SigningPublicKey
 
-	result, err := w.preBuilder.Build(job.Version, job.Platform, job.Arch, pubKey)
-	if err != nil {
-		log.Printf("Pre-build failed: %v", err)
-		w.apiClient.FailJob(job.ID, "pre-build", err.Error())
+	// Start streaming log before build begins — the builder writes to logDir
+	// We'll figure out the log path after build, but we can predict it from the builder's pattern
+	// Instead, start streaming after build starts (builder creates the file immediately)
+	// We use a channel: build runs synchronously, log streams in background
+
+	// Build runs synchronously — log file is created at the start of Build()
+	// We need the log path first. The builder creates it deterministically.
+	// Approach: start build, then stream. But build is blocking.
+	// Better: run build in goroutine, stream from known log dir.
+
+	// Run build in a goroutine so we can stream logs concurrently
+	type buildResult struct {
+		result *builder.BuildResult
+		err    error
+	}
+	resultCh := make(chan buildResult, 1)
+	go func() {
+		r, err := w.preBuilder.Build(job.Version, job.Platform, job.Arch, pubKey)
+		resultCh <- buildResult{r, err}
+	}()
+
+	// Wait briefly for the log file to be created, then start streaming
+	var logPath string
+	time.Sleep(500 * time.Millisecond)
+	// Find the most recent log file in the log dir
+	entries, _ := os.ReadDir(w.cfg.Build.LogDir)
+	for i := len(entries) - 1; i >= 0; i-- {
+		name := entries[i].Name()
+		if strings.HasPrefix(name, "prebuild_") && strings.HasSuffix(name, ".log") {
+			logPath = filepath.Join(w.cfg.Build.LogDir, name)
+			break
+		}
+	}
+
+	var stopStream context.CancelFunc
+	var cancelledCh <-chan bool
+	if logPath != "" {
+		stopStream, cancelledCh = w.streamLog(job.ID, "pre-build", logPath)
+	}
+
+	// Wait for build to complete or cancellation
+	var br buildResult
+	select {
+	case br = <-resultCh:
+		// Build finished normally
+	case <-cancelledCh:
+		// Job was cancelled — kill the build process
+		log.Printf("Job %d cancelled by user, aborting build", job.ID)
+		w.preBuilder.Cancel()
+		<-resultCh // wait for build goroutine to exit
+		if stopStream != nil {
+			stopStream()
+		}
 		return
 	}
 
-	// Send final log content
+	// Stop streaming (final flush)
+	if stopStream != nil {
+		stopStream()
+		time.Sleep(100 * time.Millisecond) // let final flush complete
+	}
+
+	if br.err != nil {
+		log.Printf("Pre-build failed: %v", br.err)
+		w.apiClient.FailJob(job.ID, "pre-build", br.err.Error())
+		return
+	}
+	result := br.result
+
 	if result.LogPath != "" {
 		w.jobLogs.Store(job.ID, result.LogPath)
-		if logContent, err := os.ReadFile(result.LogPath); err == nil {
-			if err := w.apiClient.AppendLog(job.ID, string(logContent)); err != nil {
-				log.Printf("Warning: failed to send log for job %d: %v", job.ID, err)
-			}
-		}
 	}
 
 	// Tar.gz the build output and upload to S3

@@ -109,6 +109,28 @@ func (c *Client) FetchPendingJob(name string, platforms []PlatformConfig) (*Work
 	return &job, nil
 }
 
+// IsJobCancelled checks if a job has been cancelled (status = failed with "cancelled by user").
+func (c *Client) IsJobCancelled(jobID uint, jobType string) bool {
+	resp, err := c.doRequest("GET", fmt.Sprintf("/api/worker/jobs/%d/status?type=%s", jobID, jobType), nil)
+	if err != nil {
+		return false // assume not cancelled on error
+	}
+	defer resp.Body.Close()
+
+	r, err := decodeResponse(resp)
+	if err != nil {
+		return false
+	}
+
+	var result struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(r.Data, &result); err != nil {
+		return false
+	}
+	return result.Status == "failed"
+}
+
 // StartJob reports that a job has started.
 func (c *Client) StartJob(jobID uint, jobType string) error {
 	body := map[string]string{"type": jobType}

@@ -40,7 +40,6 @@ type WorkerJob struct {
 	Platform      string `json:"platform"`
 	Arch          string `json:"arch"`
 	Format        string `json:"format,omitempty"`
-	AppName       string `json:"app_name,omitempty"`
 	CustomTxt     string `json:"custom_txt,omitempty"`
 	ArtifactS3Key string `json:"artifact_s3_key,omitempty"`
 	ArtifactDir   string `json:"artifact_dir,omitempty"`

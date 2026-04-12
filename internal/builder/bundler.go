@@ -14,19 +14,40 @@ type BundleResult struct {
 	Cleanup  func()
 }
 
+// BundleOptions contains metadata needed for packaging.
+type BundleOptions struct {
+	BuildDir       string // path to the build output folder
+	Format         string // deb, zip
+	CustomTxt      string // signed custom.txt content
+	Version        string // version string for the package
+	Arch           string // x86_64, aarch64
+	RustdeskSrcDir string // path to rustdesk source (for res/ files)
+}
+
 // Bundle takes a build output folder, injects custom.txt, and packages into the requested format.
-func Bundle(buildDir, format, customTxtContent string) (*BundleResult, error) {
-	switch format {
+func Bundle(opts BundleOptions) (*BundleResult, error) {
+	switch opts.Format {
 	case "deb":
-		return packageDeb(buildDir, customTxtContent)
+		return packageDeb(opts)
 	case "zip":
-		return packageZip(buildDir, customTxtContent)
+		return packageZip(opts)
 	default:
-		return nil, fmt.Errorf("packaging format not yet supported: %s", format)
+		return nil, fmt.Errorf("packaging format not yet supported: %s", opts.Format)
 	}
 }
 
-func packageDeb(buildDir, customTxtContent string) (*BundleResult, error) {
+func debArch(arch string) string {
+	switch arch {
+	case "x86_64":
+		return "amd64"
+	case "aarch64":
+		return "arm64"
+	default:
+		return arch
+	}
+}
+
+func packageDeb(opts BundleOptions) (*BundleResult, error) {
 	if _, err := exec.LookPath("dpkg-deb"); err != nil {
 		return nil, fmt.Errorf("dpkg-deb not found: %w", err)
 	}
@@ -39,35 +60,113 @@ func packageDeb(buildDir, customTxtContent string) (*BundleResult, error) {
 
 	debRoot := filepath.Join(workDir, "deb")
 	dataDir := filepath.Join(debRoot, "usr", "share", "rustdesk")
-	os.MkdirAll(dataDir, 0755)
-	os.MkdirAll(filepath.Join(debRoot, "usr", "bin"), 0755)
+	resDir := filepath.Join(opts.RustdeskSrcDir, "res")
 
-	cmd := exec.Command("cp", "-a", buildDir+"/.", dataDir+"/")
+	// Create directory structure matching official deb
+	for _, dir := range []string{
+		filepath.Join(debRoot, "usr", "bin"),
+		dataDir,
+		filepath.Join(dataDir, "files", "systemd"),
+		filepath.Join(debRoot, "usr", "share", "icons", "hicolor", "256x256", "apps"),
+		filepath.Join(debRoot, "usr", "share", "icons", "hicolor", "scalable", "apps"),
+		filepath.Join(debRoot, "usr", "share", "applications"),
+		filepath.Join(debRoot, "usr", "share", "polkit-1", "actions"),
+		filepath.Join(debRoot, "etc", "rustdesk"),
+		filepath.Join(debRoot, "etc", "pam.d"),
+	} {
+		os.MkdirAll(dir, 0755)
+	}
+
+	// Copy build output
+	cmd := exec.Command("cp", "-a", opts.BuildDir+"/.", dataDir+"/")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("failed to copy build output: %w\n%s", err, string(out))
 	}
 
-	if err := os.WriteFile(filepath.Join(dataDir, "custom.txt"), []byte(customTxtContent), 0644); err != nil {
+	// Inject custom.txt
+	if err := os.WriteFile(filepath.Join(dataDir, "custom.txt"), []byte(opts.CustomTxt), 0644); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("failed to write custom.txt: %w", err)
 	}
 
+	// Symlink: /usr/bin/rustdesk -> /usr/share/rustdesk/rustdesk
 	os.Symlink("/usr/share/rustdesk/rustdesk", filepath.Join(debRoot, "usr", "bin", "rustdesk"))
 
+	// Copy res files (icons, desktop entries, service, etc.)
+	copyIfExists := func(src, dst string) {
+		if _, err := os.Stat(src); err == nil {
+			exec.Command("cp", "-a", src, dst).Run()
+		}
+	}
+
+	// Icons
+	copyIfExists(filepath.Join(resDir, "128x128@2x.png"),
+		filepath.Join(debRoot, "usr", "share", "icons", "hicolor", "256x256", "apps", "rustdesk.png"))
+	copyIfExists(filepath.Join(resDir, "scalable.svg"),
+		filepath.Join(debRoot, "usr", "share", "icons", "hicolor", "scalable", "apps", "rustdesk.svg"))
+
+	// Desktop entries
+	copyIfExists(filepath.Join(resDir, "rustdesk.desktop"),
+		filepath.Join(debRoot, "usr", "share", "applications", "rustdesk.desktop"))
+	copyIfExists(filepath.Join(resDir, "rustdesk-link.desktop"),
+		filepath.Join(debRoot, "usr", "share", "applications", "rustdesk-link.desktop"))
+
+	// Systemd service
+	copyIfExists(filepath.Join(resDir, "rustdesk.service"),
+		filepath.Join(dataDir, "files", "systemd", "rustdesk.service"))
+
+	// PAM config
+	copyIfExists(filepath.Join(resDir, "pam.d", "rustdesk.debian"),
+		filepath.Join(debRoot, "etc", "pam.d", "rustdesk"))
+
+	// startwm.sh, xorg.conf
+	copyIfExists(filepath.Join(resDir, "startwm.sh"),
+		filepath.Join(debRoot, "etc", "rustdesk", "startwm.sh"))
+	copyIfExists(filepath.Join(resDir, "xorg.conf"),
+		filepath.Join(debRoot, "etc", "rustdesk", "xorg.conf"))
+
+	// Polkit helper
+	os.WriteFile(filepath.Join(dataDir, "files", "polkit"), []byte("#!/bin/sh\n"), 0755)
+
+	// DEBIAN control
 	debianDir := filepath.Join(debRoot, "DEBIAN")
 	os.MkdirAll(debianDir, 0755)
-	control := `Package: rustdesk
-Architecture: amd64
-Version: 0.0.0
-Depends: libgtk-3-0, libxcb-randr0, libxdo3 | libxdo4, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libpam0g
-Description: RustDesk custom client
-`
+
+	control := fmt.Sprintf(`Package: rustdesk
+Section: net
+Priority: optional
+Version: %s
+Architecture: %s
+Maintainer: rustdesk <info@rustdesk.com>
+Homepage: https://rustdesk.com
+Depends: libgtk-3-0, libxcb-randr0, libxdo3 | libxdo4, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libgstreamer-plugins-base1.0-0, libpam0g
+Recommends: libayatana-appindicator3-1
+Description: RustDesk - remote control software.
+
+`, opts.Version, debArch(opts.Arch))
+
 	if err := os.WriteFile(filepath.Join(debianDir, "control"), []byte(control), 0644); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("failed to write control file: %w", err)
 	}
 
+	// Copy DEBIAN scripts (postinst, postrm, preinst, prerm) from res as-is
+	debianResDir := filepath.Join(resDir, "DEBIAN")
+	if entries, err := os.ReadDir(debianResDir); err == nil {
+		for _, e := range entries {
+			if e.Name() == "control" {
+				continue // we generate our own
+			}
+			src := filepath.Join(debianResDir, e.Name())
+			dst := filepath.Join(debianDir, e.Name())
+			if data, err := os.ReadFile(src); err == nil {
+				os.WriteFile(dst, data, 0755)
+			}
+		}
+	}
+
+	// Build the deb
 	outputFile := filepath.Join(workDir, "output.deb")
 	cmd = exec.Command("dpkg-deb", "-b", debRoot, outputFile)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -84,7 +183,7 @@ Description: RustDesk custom client
 	return &BundleResult{FilePath: outputFile, FileSize: fileSize, Cleanup: cleanup}, nil
 }
 
-func packageZip(buildDir, customTxtContent string) (*BundleResult, error) {
+func packageZip(opts BundleOptions) (*BundleResult, error) {
 	if _, err := exec.LookPath("zip"); err != nil {
 		return nil, fmt.Errorf("zip not found: %w", err)
 	}
@@ -96,13 +195,13 @@ func packageZip(buildDir, customTxtContent string) (*BundleResult, error) {
 	cleanup := func() { os.RemoveAll(workDir) }
 
 	stageDir := filepath.Join(workDir, "rustdesk")
-	cmd := exec.Command("cp", "-a", buildDir, stageDir)
+	cmd := exec.Command("cp", "-a", opts.BuildDir, stageDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("failed to copy build output: %w\n%s", err, string(out))
 	}
 
-	if err := os.WriteFile(filepath.Join(stageDir, "custom.txt"), []byte(customTxtContent), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(stageDir, "custom.txt"), []byte(opts.CustomTxt), 0644); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("failed to write custom.txt: %w", err)
 	}

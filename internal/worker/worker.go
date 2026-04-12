@@ -122,11 +122,15 @@ func (w *Worker) pollLoop(ctx context.Context) {
 		job, err := w.apiClient.FetchPendingJob(w.cfg.Worker.Name, platforms)
 		if err != nil {
 			log.Printf("Error fetching job: %v", err)
-			time.Sleep(5 * time.Second)
+			if !w.waitOrDone(ctx, 5*time.Second) {
+				return
+			}
 			continue
 		}
 		if job == nil {
-			time.Sleep(5 * time.Second)
+			if !w.waitOrDone(ctx, 5*time.Second) {
+				return
+			}
 			continue
 		}
 
@@ -141,6 +145,17 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			log.Printf("Unknown job type: %s", job.Type)
 			w.apiClient.FailJob(job.ID, job.Type, "unknown job type: "+job.Type)
 		}
+	}
+}
+
+// waitOrDone waits for the given duration or until ctx is cancelled.
+// Returns true if the wait completed, false if ctx was cancelled.
+func (w *Worker) waitOrDone(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
 	}
 }
 
@@ -342,7 +357,14 @@ func (w *Worker) handleBundle(job *api.WorkerJob) {
 	}
 
 	// Bundle
-	result, err := builder.Bundle(buildDir, job.Format, job.CustomTxt)
+	result, err := builder.Bundle(builder.BundleOptions{
+		BuildDir:       buildDir,
+		Format:         job.Format,
+		CustomTxt:      job.CustomTxt,
+		Version:        job.Version,
+		Arch:           job.Arch,
+		RustdeskSrcDir: w.cfg.Build.RustdeskSrcDir,
+	})
 	if err != nil {
 		w.apiClient.FailJob(job.ID, "bundle", "bundling failed: "+err.Error())
 		return
@@ -350,15 +372,11 @@ func (w *Worker) handleBundle(job *api.WorkerJob) {
 	defer result.Cleanup()
 
 	// Upload to S3
-	appName := job.AppName
-	if appName == "" {
-		appName = "rustdesk"
-	}
 	version := job.Version
 	if version == "" {
 		version = "0.0.0"
 	}
-	filename := fmt.Sprintf("%s-%s-%s-%s.%s", appName, version, job.Platform, job.Arch, job.Format)
+	filename := fmt.Sprintf("rustdesk-%s-%s-%s.%s", version, job.Platform, job.Arch, job.Format)
 	s3Key := fmt.Sprintf("bundles/%d-%s", job.ID, filename)
 
 	contentType := "application/octet-stream"

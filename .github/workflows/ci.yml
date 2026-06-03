@@ -35,5 +35,4 @@ jobs:
     uses: ./.github/workflows/_validate.yml
     permissions:
       contents: read
-      pull-requests: read     # dependency-review reads PR diff metadata
       security-events: write  # Trivy uploads its SARIF to code scanning

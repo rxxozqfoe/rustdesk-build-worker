@@ -53,7 +53,7 @@ func (c *Client) Register(name string, platforms any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, err = decodeResponse(resp)
 	return err
 }
@@ -64,7 +64,7 @@ func (c *Client) Heartbeat(name string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, err = decodeResponse(resp)
 	return err
 }
@@ -77,7 +77,7 @@ func (c *Client) PushVersions(name string, versions []string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, err = decodeResponse(resp)
 	return err
 }
@@ -90,7 +90,7 @@ func (c *Client) FetchPendingJob(name string, platforms []PlatformConfig) (*Work
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNoContent {
 		return nil, nil
@@ -114,7 +114,7 @@ func (c *Client) IsJobCancelled(jobID uint, jobType string) bool {
 	if err != nil {
 		return false // assume not cancelled on error
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	r, err := decodeResponse(resp)
 	if err != nil {
@@ -137,7 +137,7 @@ func (c *Client) StartJob(jobID uint, jobType string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 
@@ -148,7 +148,7 @@ func (c *Client) AppendLog(jobID uint, content string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 
@@ -164,7 +164,7 @@ func (c *Client) CompleteJob(jobID uint, jobType, s3Key string, fileSize int64, 
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 
@@ -178,7 +178,7 @@ func (c *Client) FailJob(jobID uint, jobType, errMsg string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 
@@ -208,7 +208,7 @@ func (c *Client) doRequest(method, path string, body any) (*http.Response, error
 
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))
 	}
 

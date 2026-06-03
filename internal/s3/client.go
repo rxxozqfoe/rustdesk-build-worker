@@ -49,7 +49,7 @@ func (c *Client) UploadFile(ctx context.Context, key, filePath, contentType stri
 	if err != nil {
 		return "", fmt.Errorf("open file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	info, err := f.Stat()
 	if err != nil {
@@ -66,18 +66,24 @@ func (c *Client) UploadFile(ctx context.Context, key, filePath, contentType stri
 }
 
 // DownloadFile downloads an S3 object to a local file.
-func (c *Client) DownloadFile(ctx context.Context, key, destPath string) error {
+func (c *Client) DownloadFile(ctx context.Context, key, destPath string) (err error) {
 	obj, err := c.mc.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
 		return fmt.Errorf("get S3 object: %w", err)
 	}
-	defer obj.Close()
+	defer func() { _ = obj.Close() }()
 
 	f, err := os.Create(destPath)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
-	defer f.Close()
+	// A failed Close on the destination file can mean buffered data was not
+	// flushed to disk, so surface it as the result error.
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close file: %w", cerr)
+		}
+	}()
 
 	if _, err := io.Copy(f, obj); err != nil {
 		return fmt.Errorf("download: %w", err)

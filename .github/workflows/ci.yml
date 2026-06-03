@@ -1,0 +1,38 @@
+name: CI
+
+# Runs on every PR to main and every push to main. Delegates the actual
+# validation to the reusable _validate.yml workflow, so the identical
+# validation pipeline is reused by the tag-publish workflow (publish.yml)
+# without duplicating the gate.
+#
+# This workflow validates (Go quality + Dockerfile lint + base-image
+# signature verification + Trivy CVE scan) but does NOT push an image.
+# Image build + push + sign + attest happens on a v*.*.* tag via
+# publish.yml. The published image ships only the worker BINARY; the heavy
+# RustDesk build toolchain the worker shells out to (cargo, flutter,
+# vcpkg, git, dpkg-deb, ...) is expected to be provided by the runtime
+# environment, not baked into the image.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Collapse redundant runs on the same ref. On a PR, a new push cancels the
+# previous still-running validation (cancel-in-progress). On a push to main
+# we do NOT cancel — every commit that lands on the default branch keeps
+# its own complete CI record.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/_validate.yml
+    permissions:
+      contents: read
+      security-events: write  # Trivy uploads its SARIF to code scanning

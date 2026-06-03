@@ -1,0 +1,234 @@
+name: Validate (reusable)
+
+# Reusable validation pipeline called by ci.yml (on PR / main push) and by
+# publish.yml (on v*.*.* tag push). Keeps the validation rules in a single
+# place so the gate is identical whichever entry point triggers it.
+#
+# This Go service ships a container image whose runtime stage is a small,
+# signed base WITH a shell (the worker shells out to an external build
+# toolchain at run time, so distroless is not usable). The pipeline
+# therefore validates BOTH the Go code and the Dockerfile / base images:
+#   - gofmt + go vet + golangci-lint + go build + go test  (Go quality)
+#   - govulncheck (reachability-aware Go CVE scan)
+#   - hadolint + a FROM-@sha256 digest-pin gate                (Dockerfile)
+#   - cosign verify of pinned base-image signatures            (supply chain)
+#   - two-pass Trivy (block on CRITICAL/HIGH + full SARIF)     (image CVEs)
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------
+  # Go quality gate: gofmt + go vet + golangci-lint + go build + go test.
+  # golangci-lint already runs `go vet` internally, but the explicit vet
+  # step keeps a fast, dependency-free signal. gofmt is checked separately
+  # because golangci-lint's gofmt linter only reports — `gofmt -l` is the
+  # hard, unambiguous gate.
+  # -------------------------------------------------------------------
+  check:
+    name: Go check (gofmt / vet / lint / build / test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # go-version-file reads the version straight from go.mod (go 1.25.x),
+      # so the toolchain never drifts from the module's declared version.
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Verify module dependencies are tidy
+        run: |
+          set -euo pipefail
+          go mod download
+          go mod verify
+
+      - name: gofmt (check, no rewrite)
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-clean:"
+            echo "$unformatted"
+            echo "Run 'gofmt -w .' locally and commit the result."
+            exit 1
+          fi
+          echo "All Go files are gofmt-clean."
+
+      - name: go vet
+        run: go vet ./...
+
+      # Pin the linter version (not `latest`) so a newly published
+      # golangci-lint release with stricter rules can't turn a green PR
+      # red without a deliberate bump.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+        with:
+          version: v2.12.2
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...
+
+  # -------------------------------------------------------------------
+  # govulncheck: Go's official reachability-aware vulnerability scanner.
+  # Unlike Trivy (which reports every CVE in a Go binary's transitive
+  # dependency set), govulncheck only flags CVEs whose vulnerable symbols
+  # are actually reachable from our code. Fails on any reported
+  # vulnerability; fixes arrive via go.mod bumps or a Go-version upgrade
+  # (handled by Renovate). Also runs standalone (govulncheck.yml) on a
+  # daily schedule so advisories newly published against unchanged
+  # dependencies are still caught.
+  # -------------------------------------------------------------------
+  govulncheck:
+    name: Govulncheck (Go vulnerability reachability)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4
+        with:
+          go-version-file: go.mod
+          # The action's default `repo-checkout: true` runs git inside the
+          # action itself. Since actions/checkout@v6 persists credentials
+          # to a separate includeIf'd file, that inner git call can pick up
+          # a bad auth header and GitHub returns HTTP 400. We already
+          # checked out above, so skip the redundant second checkout.
+          repo-checkout: false
+
+  # -------------------------------------------------------------------
+  # Dockerfile lint: hadolint + a FROM-@sha256 digest-pin gate. hadolint
+  # has no built-in rule for digest pinning (hadolint/hadolint#773 open
+  # since 2022); DL3006/DL3007 only enforce "has a tag" and "not :latest".
+  # The awk step fills that gap.
+  # -------------------------------------------------------------------
+  lint-dockerfile:
+    name: Lint Dockerfile (hadolint + digest pin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run hadolint
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+          failure-threshold: warning
+
+      - name: Enforce FROM @sha256 digest pin
+        run: |
+          set -euo pipefail
+          unpinned=$(awk '/^FROM/ && $0 !~ /@sha256:[a-f0-9]{64}/ {print NR ": " $0}' Dockerfile || true)
+          if [ -n "$unpinned" ]; then
+            echo "::error::Unpinned FROM instruction(s) detected:"
+            echo "$unpinned"
+            exit 1
+          fi
+          echo "All FROM instructions are pinned to a digest."
+
+  # -------------------------------------------------------------------
+  # Verify cosign/sigstore signatures of the pinned base images against
+  # .github/cosign-image-policy.json. Dockerfile-agnostic.
+  # -------------------------------------------------------------------
+  verify-base-images:
+    name: Verify base image signatures
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Verify all FROM base images against policy
+        run: bash .github/scripts/verify-base-images.sh Dockerfile
+
+  # -------------------------------------------------------------------
+  # Trivy CVE scan. Builds an amd64 image into the local daemon (no
+  # registry push), then scans twice:
+  #   1. block pass — severity=CRITICAL,HIGH, exit-code=1, table format.
+  #      Fails the job on any blocking-severity finding. No SARIF here so
+  #      the failure exits cleanly (aquasecurity/trivy-action#309).
+  #   2. report pass — every severity, exit-code=0, SARIF format. Runs
+  #      unconditionally (if: always()) so even when the block pass fails
+  #      the Security tab still gets the full picture.
+  # govulncheck provides the tighter, Go-aware reachability filter; Trivy
+  # covers OS packages and non-Go libraries in the runtime image that
+  # govulncheck cannot see.
+  # -------------------------------------------------------------------
+  scan:
+    name: Trivy CVE scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build local image for scanning
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: local/scan-target:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan — block on CRITICAL/HIGH
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: local/scan-target:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      - name: Trivy scan — full SARIF report (all severities)
+        if: always()
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: local/scan-target:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          # No severity filter and exit-code=0: this pass exists purely to
+          # populate the GitHub Security tab. The block pass above gates.
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy

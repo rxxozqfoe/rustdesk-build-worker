@@ -1,0 +1,29 @@
+{
+  "$comment": "Policy for verifying base image signatures with cosign.",
+
+  "$schema_description": {
+    "policies": "Images with sigstore signatures. Matched by image-name prefix (startswith). Each entry specifies the cosign OIDC issuer and certificate-identity regex to require.",
+    "unsigned": "Images we knowingly cannot verify with sigstore today. Listed explicitly (rather than silent-skip) so that any new base image defaults to failing the check until someone makes a conscious decision."
+  },
+
+  "policies": [
+    {
+      "name": "Chainguard wolfi-base",
+      "match": "cgr.dev/chainguard/",
+      "issuer": "https://token.actions.githubusercontent.com",
+      "identity": "^https://github\\.com/chainguard-images/images/\\.github/workflows/release\\.yaml@refs/heads/main$",
+      "reason": "Every Chainguard image digest is cosign keyless-signed by the chainguard-images release workflow. Verify per https://edu.chainguard.dev/chainguard/chainguard-images/how-to-use/verifying-chainguard-images-and-metadata-signatures-with-cosign/."
+    }
+  ],
+
+  "unsigned": [
+    {
+      "match": "golang",
+      "reason": "Docker Hub official images do not publish sigstore signatures we can verify in CI; relying on digest pinning + Renovate digest bumps + the Trivy scan instead."
+    },
+    {
+      "match": "docker.io/library/golang",
+      "reason": "Same as above (fully qualified form)."
+    }
+  ]
+}

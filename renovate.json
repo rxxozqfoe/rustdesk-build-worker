@@ -1,0 +1,110 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+
+  // Mend-curated "best practices" baseline. It pulls in, among others:
+  //   - helpers:pinGitHubActionDigests  (pin uses: owner/action@v1 -> @<sha> # v1)
+  //   - :pinDevDependencies
+  //   - abandonments:recommended
+  // Plus the explicit presets we want:
+  //   - :dependencyDashboard: Renovate maintains a "Dependency Dashboard"
+  //     issue listing all pending / blocked / awaiting-approval updates.
+  //   - :semanticCommits: emit conventional-commits-style PR messages.
+  //   - helpers:pinGitHubActionDigestsToSemver: overrides the non-semver
+  //     helpers:pinGitHubActionDigests brought in by config:best-practices
+  //     so the inline comment next to a pinned SHA is the precise semver
+  //     (# v4.2.3) instead of a floating tag (# v4). Makes the pinned
+  //     version visible at a glance in review / git history / CVE
+  //     advisory cross-check.
+  "extends": [
+    "config:best-practices",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigestsToSemver"
+  ],
+
+  "timezone": "Asia/Taipei",
+
+  // Renovate is allowed to OPEN PRs only in this window (timezone above).
+  // Monday-morning batches give a single weekly inbox of updates instead
+  // of trickling PRs throughout the week. vulnerabilityAlerts overrides
+  // this with an empty schedule below, so CVE-driven PRs are NEVER delayed
+  // by this window.
+  "schedule": ["before 9am on monday"],
+
+  "labels": ["dependencies"],
+
+  // --- PR flow ---------------------------------------------------------
+
+  // automerge: explicitly false at the top level. Renovate's default is
+  // already false, but writing it makes intent unambiguous and prevents a
+  // preset or a future packageRule from flipping auto-merge on by
+  // accident. Every Renovate PR requires a human merge.
+  "automerge": false,
+
+  // prHourlyLimit: cap PR creation rate at 10 per hour. Bumped up from the
+  // config:recommended default of 2 because the default leaves updates
+  // stuck in a "branch limit reached" deferred state without surfacing
+  // them in the Dependency Dashboard's Rate-Limited section.
+  "prHourlyLimit": 10,
+
+  // prConcurrentLimit: cap total open Renovate PRs at 10.
+  "prConcurrentLimit": 10,
+
+  // --- Pinning & tidy --------------------------------------------------
+
+  // pinDigests: transform tags like `@v4` into pinned SHA references. The
+  // actual pinning behaviour is delivered by the
+  // helpers:pinGitHubActionDigests preset pulled in by
+  // config:best-practices; this line makes the intent explicit. (Go
+  // module versions are already exact SHAs/semver in go.mod/go.sum, so
+  // this primarily affects GitHub Actions here.)
+  "pinDigests": true,
+
+  // --- Stability / supply-chain gate -----------------------------------
+
+  // minimumReleaseAge: a newly released version must sit in the wild for
+  // this long before Renovate will open a PR for it. Buys a window for the
+  // community to catch malicious releases. vulnerabilityAlerts below
+  // overrides this to null so CVE fixes are never delayed by the age gate.
+  "minimumReleaseAge": "15 days",
+
+  // internalChecksFilter: "flexible" -> if the latest candidate is too new
+  // to satisfy minimumReleaseAge, Renovate falls back to the newest
+  // candidate that HAS aged and opens a PR for that (rebasing later when
+  // the newer one matures). Guarantees timely patch/security updates even
+  // on fast-moving modules instead of "always waiting".
+  "internalChecksFilter": "flexible",
+
+  // --- Vulnerability alerts overlay ------------------------------------
+  // Triggered when an advisory (OSV / GHSA) matches a current dependency.
+  // Applied as a force-overlay on top of packageRules, so anything set
+  // here wins. Null / empty values disable the corresponding gate for
+  // vuln-driven updates only.
+  //
+  // osvVulnerabilityAlerts: Renovate queries the OSV.dev database (which
+  // mirrors the Go vulnerability database) offline. Same data source as
+  // the govulncheck CI job, so CI and Renovate stay aligned on Go module
+  // CVEs. Covers direct dependencies; requires no extra PAT permissions.
+  "osvVulnerabilityAlerts": true,
+
+  "vulnerabilityAlerts": {
+    "labels": ["security", "dependencies"],
+    "schedule": [],                       // bypass any scheduling
+    "minimumReleaseAge": null,            // bypass the release-age wait
+    "dependencyDashboardApproval": false  // bypass the Dashboard approval gate
+  },
+
+  "packageRules": [
+    // Major bumps do not auto-open a PR. They appear on the Dependency
+    // Dashboard as approval checkboxes; ticking the box tells Renovate to
+    // open a real PR. Avoids PR spam from cross-major releases.
+    // vulnerabilityAlerts above overrides this so CVE-driven major
+    // upgrades still open a PR directly.
+    {
+      "description": "Major bumps go through Dependency Dashboard approval.",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true,
+      "labels": ["dependencies", "major-update"]
+    }
+  ]
+}

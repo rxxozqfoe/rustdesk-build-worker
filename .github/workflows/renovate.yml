@@ -1,0 +1,113 @@
+name: Renovate
+
+# Runs Renovate on a fixed schedule from this repository itself, instead
+# of relying on the Mend-hosted Renovate GitHub App. Configuration lives
+# in ./renovate.json.
+#
+# This repo's default branch is "main"; Renovate targets the default
+# branch automatically, so no baseBranches override is needed.
+#
+# Prerequisites (one-time setup): a GitHub App created and installed on
+# this repo, with its credentials stored as the RENOVATE_APP_ID and
+# RENOVATE_APP_PRIVATE_KEY repository secrets. The App needs these
+# repository permissions:
+#     Contents:        Read and write   (create branches, push commits)
+#     Pull requests:   Read and write   (open / update / close PRs)
+#     Workflows:       Read and write   (update .github/workflows/*.yml;
+#                                        GITHUB_TOKEN cannot)
+#     Issues:          Read and write   (maintain the Dependency Dashboard
+#                                        issue; else "Could not ensure
+#                                        issue ... 403")
+#     Commit statuses: Read and write   (set renovate/stability-days for
+#                                        minimumReleaseAge; else the run
+#                                        aborts with a misleading
+#                                        "Repository has changed during
+#                                        renovation" error)
+#     Metadata:        Read             (forced on by GitHub)
+# Full step-by-step setup: .github/RENOVATE_GITHUB_APP_SETUP.md
+#
+# Notes:
+#
+#   - The workflow's built-in GITHUB_TOKEN is NOT used for Renovate's git
+#     operations, because GITHUB_TOKEN cannot push changes that modify
+#     .github/workflows/*.yml files (GitHub blocks this by design). Hence
+#     the per-run App installation token minted below.
+#
+#   - The schedule here controls WHEN Renovate runs. The "schedule" field
+#     inside renovate.json controls when it is allowed to OPEN PRs. Both
+#     must pass for a PR to appear.
+#
+#   - Concurrency ensures only one Renovate run at a time; parallel runs
+#     can step on each other when updating the same branches.
+
+on:
+  schedule:
+    # Every 6 hours (00:00, 06:00, 12:00, 18:00 UTC).
+    # Rationale: vulnerabilityAlerts in renovate.json bypass schedule /
+    # prHourlyLimit / minimumReleaseAge once Renovate runs, but Renovate
+    # still only *runs* when this cron fires. Every 6 hours bounds the
+    # worst-case CVE-to-PR latency at ~6 hours for the self-hosted path.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: "Renovate log level"
+        type: choice
+        options: [info, debug]
+        default: info
+      dryRun:
+        description: "Dry run (log what would change, do not open PRs)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+jobs:
+  renovate:
+    name: Run Renovate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Mint a short-lived GitHub App installation token. The action
+      # resolves the installation from app-id + private-key, and
+      # owner/repositories scope the token to this repo only (without them
+      # it would cover every repo the App is installed on). See
+      # .github/RENOVATE_GITHUB_APP_SETUP.md for the one-time App setup.
+      - name: Mint Renovate installation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RENOVATE_APP_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          # Pin the minted token to exactly what Renovate needs, as a
+          # code-level allow-list. Listing any permission-* makes the
+          # token contain ONLY these scopes (+ forced metadata:read), so
+          # it can't silently inherit extra access if the App installation
+          # is later widened in the UI. Mirrors the App permission table
+          # in RENOVATE_GITHUB_APP_SETUP.md.
+          permission-contents: write       # create branches, push commits
+          permission-pull-requests: write  # open / update / close PRs
+          permission-issues: write         # Dependency Dashboard issue
+          permission-statuses: write       # renovate/stability-days status
+          permission-workflows: write      # update .github/workflows/*
+
+      - name: Run Renovate
+        uses: renovatebot/github-action@3633cede7d4d4598438e654eac4a695e46004420 # v46.1.7
+        with:
+          configurationFile: renovate.json
+          token: ${{ steps.app-token.outputs.token }}
+        env:
+          LOG_LEVEL: ${{ inputs.logLevel || 'info' }}
+          RENOVATE_DRY_RUN: ${{ inputs.dryRun && 'full' || '' }}
+          # Scope Renovate to this repository only.
+          RENOVATE_REPOSITORIES: ${{ github.repository }}

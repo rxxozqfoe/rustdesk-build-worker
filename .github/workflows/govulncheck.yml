@@ -1,0 +1,65 @@
+name: govulncheck
+
+# Supply-chain vulnerability scan over the whole Go module graph via the
+# official govulncheck-action. This is the Go analogue of the Rust fork's
+# cargo-deny.yml:
+#   - govulncheck queries the Go vulnerability database (vuln.go.dev) and,
+#     unlike a plain advisory list, uses call-graph analysis so it only
+#     flags advisories whose vulnerable symbols are actually reachable
+#     from this module's code.
+#
+# HARD, BLOCKING gate: govulncheck exits non-zero on any reachable
+# vulnerability and that fails the workflow by design. Do NOT add
+# continue-on-error.
+#
+# Unlike the per-PR check job (in _validate.yml), the advisory result only
+# changes when either:
+#   1. the dependency set changes -> go.mod / go.sum edits
+#   2. a new advisory is published against an unchanged dependency
+#      -> covered by the daily schedule
+# so this runs on those triggers only, not on every push.
+
+on:
+  pull_request:
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/govulncheck.yml"
+  push:
+    branches: [main]
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/govulncheck.yml"
+  schedule:
+    # Daily at 03:00 UTC — catches advisories newly published against
+    # dependencies that have not otherwise changed.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: govulncheck-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  govulncheck:
+    name: govulncheck (Go vulnerability database)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # The action installs and runs govulncheck itself; go-version-file
+      # keeps its toolchain aligned with the module's declared Go version.
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          go-package: ./...

@@ -1,0 +1,37 @@
+name: CI
+
+# Runs on every PR to main and every push to main. Delegates the actual
+# validation to the reusable _validate.yml workflow, so the identical
+# validation pipeline can be reused by any future entry point (e.g. a
+# tag-publish workflow) without duplicating the gate.
+#
+# This workflow does NOT build or push a container image. build-worker is
+# a Go service that shells out to a full RustDesk build toolchain (cargo,
+# flutter, vcpkg, git worktrees, dpkg-deb, zip) against a pre-cloned
+# source tree at runtime, so a clean minimal image is not feasible today;
+# the pipeline is validate-only. A container pipeline can be added later
+# (see the PR description) once a reproducible build environment exists.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Collapse redundant runs on the same ref. On a PR, a new push cancels the
+# previous still-running validation (cancel-in-progress). On a push to main
+# we do NOT cancel — every commit that lands on the default branch keeps
+# its own complete CI record.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/_validate.yml
+    permissions:
+      contents: read
+      pull-requests: read   # dependency-review reads PR diff metadata

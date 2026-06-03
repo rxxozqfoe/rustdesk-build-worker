@@ -1,0 +1,14 @@
+# Code owners for rustdesk-build-worker.
+#
+# GitHub requests a review from the listed owner(s) automatically when a
+# PR touches a matching path. Combined with branch protection ("Require
+# review from Code Owners"), this makes the CI/CD configuration below a
+# review-gated surface.
+#
+# The owner is the repository owner; adjust to a team (e.g. @org/ci) once
+# one exists.
+
+# CI/CD and supply-chain configuration.
+/.github/workflows/   @rxxozqfoe
+/.github/             @rxxozqfoe
+/renovate.json        @rxxozqfoe

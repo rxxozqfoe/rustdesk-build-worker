@@ -1,0 +1,106 @@
+name: Validate (reusable)
+
+# Reusable validation pipeline called by ci.yml (on PR / main push) and
+# reusable by any future entry point (e.g. a tag-publish workflow). Keeps
+# the validation rules in a single place so the gate is identical whichever
+# entry point triggers it.
+#
+# Adapted from the rustdesk-server Rust fork's _validate.yml to this Go
+# service:
+#   - cargo fmt/clippy/check (-p hbbs)  -> gofmt + go vet + golangci-lint + go build
+#   - cargo-deny (RustSec advisories)   -> govulncheck (own workflow) + dependency-review
+#
+# build-worker is validate-only: it ships a Go binary, not a container
+# image. The hadolint / verify-base-images / Trivy jobs from the Rust
+# template are intentionally absent because there is no Dockerfile yet
+# (the service shells out to a full RustDesk build toolchain at runtime).
+# Add those jobs back if/when a Dockerfile is introduced.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------
+  # Go quality gate: gofmt + go vet + golangci-lint + go build + go test.
+  # golangci-lint already runs `go vet` internally, but the explicit vet
+  # step keeps a fast, dependency-free signal and matches the workspace's
+  # "go vet" guidance. gofmt is checked separately because golangci-lint's
+  # gofmt linter only reports — `gofmt -l` is the hard, unambiguous gate.
+  # -------------------------------------------------------------------
+  check:
+    name: Go check (gofmt / vet / lint / build / test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # go-version-file reads the version straight from go.mod (go 1.25.x),
+      # so the toolchain never drifts from the module's declared version.
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Verify module dependencies are tidy
+        run: |
+          set -euo pipefail
+          go mod download
+          go mod verify
+
+      - name: gofmt (check, no rewrite)
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-clean:"
+            echo "$unformatted"
+            echo "Run 'gofmt -w .' locally and commit the result."
+            exit 1
+          fi
+          echo "All Go files are gofmt-clean."
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+        with:
+          version: latest
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...
+
+  # -------------------------------------------------------------------
+  # dependency-review: PR-only gate that blocks a PR introducing a
+  # dependency with a known vulnerability or a disallowed licence. It
+  # diffs the PR's go.mod / go.sum against the base branch, so it has no
+  # meaning on a plain push (no base ref) and is skipped there. The
+  # deeper, schedule-driven advisory scan over the *whole* module graph
+  # lives in govulncheck.yml.
+  # -------------------------------------------------------------------
+  dependency-review:
+    name: Dependency review (PR only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high

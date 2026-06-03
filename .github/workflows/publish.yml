@@ -296,7 +296,11 @@ jobs:
       - name: Verify signature
         env:
           IMAGE_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.merge.outputs.digest }}
-          IDENTITY_REGEXP: ^https://github\.com/${{ github.repository }}/\.github/workflows/.+@refs/tags/v.+
+          # Pin the signer identity to publish.yml specifically — the merge
+          # job above is the only thing that signs, so its OIDC identity is
+          # always .../publish.yml@refs/tags/<tag>. A broad workflows/.+
+          # would accept a signature minted by ANY workflow file at a v-tag.
+          IDENTITY_REGEXP: ^https://github\.com/${{ github.repository }}/\.github/workflows/publish\.yml@refs/tags/v.+
         run: |
           set -euo pipefail
           cosign verify \

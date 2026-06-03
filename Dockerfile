@@ -3,7 +3,7 @@
 # ---- Build stage ----
 # Pure-Go service: no cgo (no sqlite / C bindings), so we build a fully
 # static binary with CGO_ENABLED=0. No build-base / musl-dev needed.
-FROM golang:1.25.8-alpine@sha256:8e02eb337d9e0ea459e041f1ee5eece41cbb61f1d83e7d883a3e2fb4862063fa AS builder
+FROM golang:1.26-alpine@sha256:f23e8b227fb4493eabe03bede4d5a32d04092da71962f1fb79b5f7d1e6c2a17f AS builder
 
 ARG TARGETOS
 ARG TARGETARCH

@@ -1,8 +1,7 @@
 name: govulncheck
 
 # Supply-chain vulnerability scan over the whole Go module graph via the
-# official govulncheck-action. This is the Go analogue of the Rust fork's
-# cargo-deny.yml:
+# official govulncheck-action:
 #   - govulncheck queries the Go vulnerability database (vuln.go.dev) and,
 #     unlike a plain advisory list, uses call-graph analysis so it only
 #     flags advisories whose vulnerable symbols are actually reachable

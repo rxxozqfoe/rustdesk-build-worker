@@ -2,15 +2,16 @@ name: CI
 
 # Runs on every PR to main and every push to main. Delegates the actual
 # validation to the reusable _validate.yml workflow, so the identical
-# validation pipeline can be reused by any future entry point (e.g. a
-# tag-publish workflow) without duplicating the gate.
+# validation pipeline is reused by the tag-publish workflow (publish.yml)
+# without duplicating the gate.
 #
-# This workflow does NOT build or push a container image. build-worker is
-# a Go service that shells out to a full RustDesk build toolchain (cargo,
-# flutter, vcpkg, git worktrees, dpkg-deb, zip) against a pre-cloned
-# source tree at runtime, so a clean minimal image is not feasible today;
-# the pipeline is validate-only. A container pipeline can be added later
-# (see the PR description) once a reproducible build environment exists.
+# This workflow validates (Go quality + Dockerfile lint + base-image
+# signature verification + Trivy CVE scan) but does NOT push an image.
+# Image build + push + sign + attest happens on a v*.*.* tag via
+# publish.yml. The published image ships only the worker BINARY; the heavy
+# RustDesk build toolchain the worker shells out to (cargo, flutter,
+# vcpkg, git, dpkg-deb, ...) is expected to be provided by the runtime
+# environment, not baked into the image.
 
 on:
   push:
@@ -34,4 +35,5 @@ jobs:
     uses: ./.github/workflows/_validate.yml
     permissions:
       contents: read
-      pull-requests: read   # dependency-review reads PR diff metadata
+      pull-requests: read     # dependency-review reads PR diff metadata
+      security-events: write  # Trivy uploads its SARIF to code scanning

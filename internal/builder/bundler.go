@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,7 +57,7 @@ func packageDeb(opts BundleOptions) (*BundleResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	cleanup := func() { os.RemoveAll(workDir) }
+	cleanup := func() { _ = os.RemoveAll(workDir) }
 
 	debRoot := filepath.Join(workDir, "deb")
 	dataDir := filepath.Join(debRoot, "usr", "share", "rustdesk")
@@ -74,7 +75,10 @@ func packageDeb(opts BundleOptions) (*BundleResult, error) {
 		filepath.Join(debRoot, "etc", "rustdesk"),
 		filepath.Join(debRoot, "etc", "pam.d"),
 	} {
-		os.MkdirAll(dir, 0755)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("failed to create %s: %w", dir, err)
+		}
 	}
 
 	// Copy build output
@@ -91,12 +95,17 @@ func packageDeb(opts BundleOptions) (*BundleResult, error) {
 	}
 
 	// Symlink: /usr/bin/rustdesk -> /usr/share/rustdesk/rustdesk
-	os.Symlink("/usr/share/rustdesk/rustdesk", filepath.Join(debRoot, "usr", "bin", "rustdesk"))
+	if err := os.Symlink("/usr/share/rustdesk/rustdesk", filepath.Join(debRoot, "usr", "bin", "rustdesk")); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to create rustdesk symlink: %w", err)
+	}
 
 	// Copy res files (icons, desktop entries, service, etc.)
 	copyIfExists := func(src, dst string) {
 		if _, err := os.Stat(src); err == nil {
-			exec.Command("cp", "-a", src, dst).Run()
+			if err := exec.Command("cp", "-a", src, dst).Run(); err != nil {
+				log.Printf("Warning: failed to copy %s to %s: %v", src, dst, err)
+			}
 		}
 	}
 
@@ -127,11 +136,17 @@ func packageDeb(opts BundleOptions) (*BundleResult, error) {
 		filepath.Join(debRoot, "etc", "rustdesk", "xorg.conf"))
 
 	// Polkit helper
-	os.WriteFile(filepath.Join(dataDir, "files", "polkit"), []byte("#!/bin/sh\n"), 0755)
+	if err := os.WriteFile(filepath.Join(dataDir, "files", "polkit"), []byte("#!/bin/sh\n"), 0755); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to write polkit helper: %w", err)
+	}
 
 	// DEBIAN control
 	debianDir := filepath.Join(debRoot, "DEBIAN")
-	os.MkdirAll(debianDir, 0755)
+	if err := os.MkdirAll(debianDir, 0755); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to create DEBIAN dir: %w", err)
+	}
 
 	control := fmt.Sprintf(`Package: rustdesk
 Section: net
@@ -161,7 +176,10 @@ Description: RustDesk - remote control software.
 			src := filepath.Join(debianResDir, e.Name())
 			dst := filepath.Join(debianDir, e.Name())
 			if data, err := os.ReadFile(src); err == nil {
-				os.WriteFile(dst, data, 0755)
+				if err := os.WriteFile(dst, data, 0755); err != nil {
+					cleanup()
+					return nil, fmt.Errorf("failed to write DEBIAN script %s: %w", e.Name(), err)
+				}
 			}
 		}
 	}
@@ -192,7 +210,7 @@ func packageZip(opts BundleOptions) (*BundleResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	cleanup := func() { os.RemoveAll(workDir) }
+	cleanup := func() { _ = os.RemoveAll(workDir) }
 
 	stageDir := filepath.Join(workDir, "rustdesk")
 	cmd := exec.Command("cp", "-a", opts.BuildDir, stageDir)

@@ -96,7 +96,9 @@ func (w *Worker) versionPushLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if versions, err := w.preBuilder.ListVersions(); err == nil {
-				w.apiClient.PushVersions(w.cfg.Worker.Name, versions)
+				if err := w.apiClient.PushVersions(w.cfg.Worker.Name, versions); err != nil {
+					log.Printf("Warning: failed to push versions: %v", err)
+				}
 			}
 		}
 	}
@@ -143,7 +145,7 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			w.handleBundle(job)
 		default:
 			log.Printf("Unknown job type: %s", job.Type)
-			w.apiClient.FailJob(job.ID, job.Type, "unknown job type: "+job.Type)
+			w.failJob(job.ID, job.Type, "unknown job type: "+job.Type)
 		}
 	}
 }
@@ -193,17 +195,21 @@ func (w *Worker) pushLogIncrement(jobID uint, logPath string, offset *int64) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if *offset > 0 {
-		f.Seek(*offset, io.SeekStart)
+		if _, err := f.Seek(*offset, io.SeekStart); err != nil {
+			return
+		}
 	}
 	data, err := io.ReadAll(f)
 	if err != nil || len(data) == 0 {
 		return
 	}
 	*offset += int64(len(data))
-	w.apiClient.AppendLog(jobID, string(data))
+	if err := w.apiClient.AppendLog(jobID, string(data)); err != nil {
+		log.Printf("Failed to append log for job %d: %v", jobID, err)
+	}
 }
 
 func (w *Worker) handlePreBuild(job *api.WorkerJob) {
@@ -278,7 +284,7 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 
 	if br.err != nil {
 		log.Printf("Pre-build failed: %v", br.err)
-		w.apiClient.FailJob(job.ID, "pre-build", br.err.Error())
+		w.failJob(job.ID, "pre-build", br.err.Error())
 		return
 	}
 	result := br.result
@@ -290,17 +296,17 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 	// Tar.gz the build output and upload to S3
 	s3Key := fmt.Sprintf("pre-builds/%s-%s-%s.tar.gz", job.Platform, job.Arch, job.Version)
 	tarPath := filepath.Join(os.TempDir(), fmt.Sprintf("prebuild-%d.tar.gz", job.ID))
-	defer os.Remove(tarPath)
+	defer func() { _ = os.Remove(tarPath) }()
 
 	if err := createTarGz(tarPath, result.OutputDir); err != nil {
 		log.Printf("Failed to create tar.gz: %v", err)
-		w.apiClient.FailJob(job.ID, "pre-build", "tar.gz creation failed: "+err.Error())
+		w.failJob(job.ID, "pre-build", "tar.gz creation failed: "+err.Error())
 		return
 	}
 
 	if _, err := w.s3Client.UploadFile(context.Background(), s3Key, tarPath, "application/gzip"); err != nil {
 		log.Printf("S3 upload failed: %v", err)
-		w.apiClient.FailJob(job.ID, "pre-build", "S3 upload failed: "+err.Error())
+		w.failJob(job.ID, "pre-build", "S3 upload failed: "+err.Error())
 		return
 	}
 
@@ -315,7 +321,17 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 	}
 
 	log.Printf("Pre-build completed, S3 key: %s", s3Key)
-	w.apiClient.CompleteJob(job.ID, "pre-build", s3Key, 0, logS3Key)
+	if err := w.apiClient.CompleteJob(job.ID, "pre-build", s3Key, 0, logS3Key); err != nil {
+		log.Printf("Failed to report job %d completion: %v", job.ID, err)
+	}
+}
+
+// failJob reports a job failure to the API server, logging any error from the
+// report call itself so backend state-reporting failures are not silently dropped.
+func (w *Worker) failJob(jobID uint, jobType, msg string) {
+	if err := w.apiClient.FailJob(jobID, jobType, msg); err != nil {
+		log.Printf("Failed to report job %d failure: %v", jobID, err)
+	}
 }
 
 func (w *Worker) handleBundle(job *api.WorkerJob) {
@@ -325,34 +341,34 @@ func (w *Worker) handleBundle(job *api.WorkerJob) {
 		// Download from S3
 		tmpDir, err := os.MkdirTemp("", "bundle-artifact-*")
 		if err != nil {
-			w.apiClient.FailJob(job.ID, "bundle", "failed to create temp dir: "+err.Error())
+			w.failJob(job.ID, "bundle", "failed to create temp dir: "+err.Error())
 			return
 		}
-		defer os.RemoveAll(tmpDir)
+		defer func() { _ = os.RemoveAll(tmpDir) }()
 
 		tarPath := filepath.Join(tmpDir, "artifact.tar.gz")
 		if err := w.s3Client.DownloadFile(context.Background(), job.ArtifactS3Key, tarPath); err != nil {
-			w.apiClient.FailJob(job.ID, "bundle", "S3 download failed: "+err.Error())
+			w.failJob(job.ID, "bundle", "S3 download failed: "+err.Error())
 			return
 		}
 
 		if err := extractTarGz(tarPath, tmpDir); err != nil {
-			w.apiClient.FailJob(job.ID, "bundle", "tar.gz extraction failed: "+err.Error())
+			w.failJob(job.ID, "bundle", "tar.gz extraction failed: "+err.Error())
 			return
 		}
-		os.Remove(tarPath)
+		_ = os.Remove(tarPath)
 
 		// Find the extracted directory (should be a single subdirectory)
 		entries, _ := os.ReadDir(tmpDir)
 		if len(entries) == 0 {
-			w.apiClient.FailJob(job.ID, "bundle", "no files in extracted artifact")
+			w.failJob(job.ID, "bundle", "no files in extracted artifact")
 			return
 		}
 		buildDir = filepath.Join(tmpDir, entries[0].Name())
 	} else if job.ArtifactDir != "" {
 		buildDir = job.ArtifactDir
 	} else {
-		w.apiClient.FailJob(job.ID, "bundle", "no artifact source specified")
+		w.failJob(job.ID, "bundle", "no artifact source specified")
 		return
 	}
 
@@ -366,7 +382,7 @@ func (w *Worker) handleBundle(job *api.WorkerJob) {
 		RustdeskSrcDir: w.cfg.Build.RustdeskSrcDir,
 	})
 	if err != nil {
-		w.apiClient.FailJob(job.ID, "bundle", "bundling failed: "+err.Error())
+		w.failJob(job.ID, "bundle", "bundling failed: "+err.Error())
 		return
 	}
 	defer result.Cleanup()
@@ -388,26 +404,39 @@ func (w *Worker) handleBundle(job *api.WorkerJob) {
 	}
 
 	if _, err := w.s3Client.UploadFile(context.Background(), s3Key, result.FilePath, contentType); err != nil {
-		w.apiClient.FailJob(job.ID, "bundle", "S3 upload failed: "+err.Error())
+		w.failJob(job.ID, "bundle", "S3 upload failed: "+err.Error())
 		return
 	}
 
 	log.Printf("Bundle completed, S3 key: %s", s3Key)
-	w.apiClient.CompleteJob(job.ID, "bundle", s3Key, result.FileSize, "")
+	if err := w.apiClient.CompleteJob(job.ID, "bundle", s3Key, result.FileSize, ""); err != nil {
+		log.Printf("Failed to report job %d completion: %v", job.ID, err)
+	}
 }
 
-func createTarGz(outputPath, sourceDir string) error {
+func createTarGz(outputPath, sourceDir string) (err error) {
 	f, err := os.Create(outputPath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	gw := gzip.NewWriter(f)
-	defer gw.Close()
-
 	tw := tar.NewWriter(gw)
-	defer tw.Close()
+	// Close writers in reverse order. A failed Close on the tar or gzip writer
+	// can mean the archive was truncated, so propagate it as the result error.
+	defer func() {
+		if cerr := tw.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		if cerr := gw.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	baseDir := filepath.Base(sourceDir)
 	return filepath.WalkDir(sourceDir, func(path string, d os.DirEntry, err error) error {
@@ -452,8 +481,10 @@ func createTarGz(outputPath, sourceDir string) error {
 			if err != nil {
 				return err
 			}
-			defer file.Close()
 			_, err = io.Copy(tw, file)
+			if cerr := file.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
 			return err
 		}
 		return nil
@@ -467,13 +498,13 @@ func extractTarGz(tarPath, destDir string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	gr, err := gzip.NewReader(f)
 	if err != nil {
 		return err
 	}
-	defer gr.Close()
+	defer func() { _ = gr.Close() }()
 
 	tr := tar.NewReader(gr)
 	for {
@@ -494,19 +525,27 @@ func extractTarGz(tarPath, destDir string) error {
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			os.MkdirAll(target, 0755)
+			if err := os.MkdirAll(target, 0755); err != nil {
+				return err
+			}
 		case tar.TypeReg:
-			os.MkdirAll(filepath.Dir(target), 0755)
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
 			f, err := os.Create(target)
 			if err != nil {
 				return err
 			}
 			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
+				_ = f.Close()
 				return err
 			}
-			f.Close()
-			os.Chmod(target, os.FileMode(header.Mode)&0777) // mask setuid/setgid
+			if err := f.Close(); err != nil {
+				return err
+			}
+			if err := os.Chmod(target, os.FileMode(header.Mode)&0777); err != nil { // mask setuid/setgid
+				return err
+			}
 		case tar.TypeSymlink:
 			// Validate symlink target stays within destination
 			linkTarget := header.Linkname
@@ -517,8 +556,12 @@ func extractTarGz(tarPath, destDir string) error {
 				filepath.Clean(linkTarget) != filepath.Clean(destDir) {
 				return fmt.Errorf("tar symlink %q points outside destination: %s", header.Name, header.Linkname)
 			}
-			os.MkdirAll(filepath.Dir(target), 0755)
-			os.Symlink(header.Linkname, target)
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

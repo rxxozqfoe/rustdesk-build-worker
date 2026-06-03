@@ -72,20 +72,22 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 	worktreeDir, _ := filepath.Abs(b.worktreeDir)
 	srcDir, _ := filepath.Abs(b.srcDir)
 
-	os.MkdirAll(b.logDir, 0755)
+	if err := os.MkdirAll(b.logDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create log dir: %w", err)
+	}
 	logPath := filepath.Join(b.logDir, fmt.Sprintf("prebuild_%s_%s_%s_%d.log", version, platform, arch, time.Now().Unix()))
 
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create log file: %v", err)
 	}
-	defer logFile.Close()
+	defer func() { _ = logFile.Close() }()
 
 	logger := bufio.NewWriter(logFile)
 	writeLog := func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
-		fmt.Fprintf(logger, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
-		logger.Flush()
+		_, _ = fmt.Fprintf(logger, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
+		_ = logger.Flush()
 	}
 
 	writeLog("Pre-build started: version=%s platform=%s arch=%s", version, platform, arch)
@@ -101,7 +103,7 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 	if err := b.runInDir(worktreeDir, logFile, "git", "checkout", "--force", version); err != nil {
 		return nil, fmt.Errorf("git checkout %s failed: %v", version, err)
 	}
-	b.runInDir(worktreeDir, logFile, "git", "clean", "-fd")
+	_ = b.runInDir(worktreeDir, logFile, "git", "clean", "-fd") // best-effort cleanup
 
 	writeLog("Initializing git submodules...")
 	if err := b.runInDir(worktreeDir, logFile, "git", "submodule", "update", "--init", "--recursive"); err != nil {
@@ -132,7 +134,7 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 	// Step 1: flutter_rust_bridge codegen
 	writeLog("Step 1/4: Generating flutter_rust_bridge code...")
 	pubspecPath := filepath.Join(worktreeDir, "flutter", "pubspec.yaml")
-	b.runBuildCmd(worktreeDir, logFile, "sed", "-i",
+	_ = b.runBuildCmd(worktreeDir, logFile, "sed", "-i", // best-effort patch
 		"s/extended_text: 14.0.0/extended_text: 13.0.0/g", pubspecPath)
 	if err := b.runBuildCmd(filepath.Join(worktreeDir, "flutter"), logFile, "flutter", "pub", "get"); err != nil {
 		return nil, fmt.Errorf("flutter pub get failed: %v", err)
@@ -156,12 +158,12 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 	// Step 3: FFI bindgen workaround
 	writeLog("Step 3/4: Applying FFI bindgen workaround...")
 	bridgeDart := filepath.Join(worktreeDir, "flutter", "lib", "generated_bridge.dart")
-	b.runBuildCmd(worktreeDir, logFile, "sed", "-i",
+	_ = b.runBuildCmd(worktreeDir, logFile, "sed", "-i", // best-effort workaround
 		"s/ffi.NativeFunction<ffi.Bool Function(DartPort/ffi.NativeFunction<ffi.Uint8 Function(DartPort/g",
 		bridgeDart)
 
 	// Step 4: Build Flutter
-	b.runBuildCmd(worktreeDir, logFile, "git", "checkout", "--", "flutter/pubspec.yaml")
+	_ = b.runBuildCmd(worktreeDir, logFile, "git", "checkout", "--", "flutter/pubspec.yaml") // best-effort restore
 	writeLog("Step 4/4: Building Flutter UI...")
 	if err := b.runBuildCmd(filepath.Join(worktreeDir, "flutter"), logFile, "flutter", "build", "linux", "--release"); err != nil {
 		return nil, fmt.Errorf("flutter build failed: %v", err)
@@ -183,7 +185,7 @@ func (b *PreBuilder) Cancel() {
 	b.mu.Unlock()
 
 	if cmd != nil && cmd.Process != nil {
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
 }
 
@@ -196,10 +198,12 @@ func (b *PreBuilder) GetLogContent(logPath string, offset int64) (string, int64,
 		}
 		return "", 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if offset > 0 {
-		f.Seek(offset, io.SeekStart)
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return "", 0, err
+		}
 	}
 
 	data, err := io.ReadAll(f)
@@ -216,15 +220,17 @@ func (b *PreBuilder) ensureWorktree(srcDir, worktreeDir string, writeLog func(st
 	if _, err := os.Stat(absWt); err == nil {
 		if err := b.runInDir(absWt, nil, "git", "status"); err != nil {
 			writeLog("Existing worktree seems broken, removing and recreating...")
-			os.RemoveAll(absWt)
-			exec.Command("git", "-C", absSrc, "worktree", "remove", "--force", absWt).Run()
+			_ = os.RemoveAll(absWt)
+			_ = exec.Command("git", "-C", absSrc, "worktree", "remove", "--force", absWt).Run()
 		} else {
 			return nil
 		}
 	}
 
 	writeLog("Creating build worktree at %s (source: %s)...", absWt, absSrc)
-	os.MkdirAll(filepath.Dir(absWt), 0755)
+	if err := os.MkdirAll(filepath.Dir(absWt), 0755); err != nil {
+		return fmt.Errorf("failed to create worktree parent dir: %w", err)
+	}
 	cmd := exec.Command("git", "-C", absSrc, "worktree", "add", "--detach", absWt)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git worktree add failed: %w\n%s", err, string(out))

@@ -10,7 +10,6 @@ name: Validate (reusable)
 # therefore validates BOTH the Go code and the Dockerfile / base images:
 #   - gofmt + go vet + golangci-lint + go build + go test  (Go quality)
 #   - govulncheck (reachability-aware Go CVE scan)
-#   - dependency-review (PR-only GitHub Advisory DB gate on go.mod/go.sum)
 #   - hadolint + a FROM-@sha256 digest-pin gate                (Dockerfile)
 #   - cosign verify of pinned base-image signatures            (supply chain)
 #   - two-pass Trivy (block on CRITICAL/HIGH + full SARIF)     (image CVEs)
@@ -68,10 +67,13 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # Pin the linter version (not `latest`) so a newly published
+      # golangci-lint release with stricter rules can't turn a green PR
+      # red without a deliberate bump.
       - name: golangci-lint
         uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
         with:
-          version: latest
+          version: v2.12.2
 
       - name: go build
         run: go build ./...

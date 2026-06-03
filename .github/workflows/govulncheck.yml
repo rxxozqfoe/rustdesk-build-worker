@@ -62,3 +62,10 @@ jobs:
           go-version-file: go.mod
           check-latest: true
           go-package: ./...
+          # The action's default repo-checkout: true runs git inside the
+          # action itself. Since actions/checkout@v6 persists credentials to
+          # a separate includeIf'd file, that inner git call picks up a bad
+          # auth header and the host returns HTTP 400 (git exit 128), failing
+          # the job before any scan runs. We already checked out above, so
+          # skip the redundant second checkout.
+          repo-checkout: false

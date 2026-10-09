@@ -3,7 +3,7 @@
 # ---- Build stage ----
 # Pure-Go service: no cgo (no sqlite / C bindings), so we build a fully
 # static binary with CGO_ENABLED=0. No build-base / musl-dev needed.
-FROM golang:1.26-alpine@sha256:f23e8b227fb4493eabe03bede4d5a32d04092da71962f1fb79b5f7d1e6c2a17f AS builder
+FROM golang:1.26-alpine@sha256:c95332c2af86b6d89b91bd0500f4b9529ccbd090a0d1855c6d1ceaa142ae8615 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # NOT baked in; it is expected to be provided by the runtime environment
 # (mounted onto the host, or layered into a derived image). See the PR
 # description for the runtime-toolchain caveat.
-FROM cgr.dev/chainguard/wolfi-base@sha256:cb2fc9d795bf874e660dbc25958cfa699b55e789235896ec7c354c57d3e3a704
+FROM cgr.dev/chainguard/wolfi-base@sha256:05d24163df148be377275af8374c16523a1dc7e19bf4f1c689784791553c5e45
 
 WORKDIR /app
 

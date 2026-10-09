@@ -34,11 +34,14 @@ func New(cfg *config.Config, apiClient *api.Client, s3Client *s3.Client) *Worker
 		cfg:       cfg,
 		apiClient: apiClient,
 		s3Client:  s3Client,
-		preBuilder: builder.NewPreBuilder(
-			cfg.Build.RustdeskSrcDir,
-			cfg.Build.RustdeskRepoURL,
-			cfg.Build.LogDir,
-		),
+		preBuilder: builder.NewPreBuilder(builder.Options{
+			SrcDir:       cfg.Build.RustdeskSrcDir,
+			RepoURL:      cfg.Build.RustdeskRepoURL,
+			VcpkgDir:     cfg.Build.VcpkgDir,
+			VcpkgRepoURL: cfg.Build.VcpkgRepoURL,
+			LogDir:       cfg.Build.LogDir,
+			Jobs:         cfg.Build.Jobs,
+		}),
 	}
 }
 

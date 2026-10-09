@@ -16,27 +16,45 @@ import (
 	"time"
 )
 
-// PreBuilder handles compiling RustDesk from source. srcDir is a clone the
-// worker owns: it is created from repoURL when missing, and builds check out
-// and reset it freely, so it must never be a checkout someone works in.
+// Options configures a PreBuilder. SrcDir and VcpkgDir are clones the worker
+// owns: created from their repo URLs when missing and reset by every build,
+// so neither may be a checkout someone works in.
+type Options struct {
+	SrcDir       string
+	RepoURL      string
+	VcpkgDir     string
+	VcpkgRepoURL string
+	LogDir       string
+	// Jobs bounds build parallelism (CARGO_BUILD_JOBS and
+	// VCPKG_MAX_CONCURRENCY); 0 leaves the tools' defaults.
+	Jobs int
+}
+
+// PreBuilder handles compiling RustDesk from source.
 type PreBuilder struct {
-	srcDir  string
-	repoURL string
-	logDir  string
+	srcDir       string
+	repoURL      string
+	vcpkgDir     string
+	vcpkgRepoURL string
+	logDir       string
+	jobs         int
 
 	mu        sync.Mutex
 	cancelCmd *exec.Cmd
 
-	// gitMu serialises clone/fetch/checkout in srcDir between the build and
-	// the periodic version refresh.
+	// gitMu serialises clone/fetch/checkout in srcDir and vcpkgDir between
+	// the build and the periodic version refresh.
 	gitMu sync.Mutex
 }
 
-func NewPreBuilder(srcDir, repoURL, logDir string) *PreBuilder {
+func NewPreBuilder(o Options) *PreBuilder {
 	return &PreBuilder{
-		srcDir:  srcDir,
-		repoURL: repoURL,
-		logDir:  logDir,
+		srcDir:       o.SrcDir,
+		repoURL:      o.RepoURL,
+		vcpkgDir:     o.VcpkgDir,
+		vcpkgRepoURL: o.VcpkgRepoURL,
+		logDir:       o.LogDir,
+		jobs:         o.Jobs,
 	}
 }
 
@@ -74,12 +92,12 @@ func redactURL(raw string) string {
 
 // runGitRemote runs a git command that talks to repoURL. Its output can echo
 // the URL, so it is written to logWriter only with the URL redacted.
-func (b *PreBuilder) runGitRemote(dir string, logWriter io.Writer, args ...string) error {
+func runGitRemote(repoURL, dir string, logWriter io.Writer, args ...string) error {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if logWriter != nil && len(out) > 0 {
-		_, _ = io.WriteString(logWriter, strings.ReplaceAll(string(out), b.repoURL, redactURL(b.repoURL)))
+		_, _ = io.WriteString(logWriter, strings.ReplaceAll(string(out), repoURL, redactURL(repoURL)))
 	}
 	return err
 }
@@ -92,12 +110,12 @@ func (b *PreBuilder) syncSource(logWriter io.Writer) error {
 		if err := os.MkdirAll(filepath.Dir(srcDir), 0755); err != nil {
 			return fmt.Errorf("failed to create %s: %w", filepath.Dir(srcDir), err)
 		}
-		if err := b.runGitRemote("", logWriter, "clone", b.repoURL, srcDir); err != nil {
+		if err := runGitRemote(b.repoURL, "", logWriter, "clone", b.repoURL, srcDir); err != nil {
 			return fmt.Errorf("git clone %s failed: %w", redactURL(b.repoURL), err)
 		}
 		return nil
 	}
-	if err := b.runGitRemote(srcDir, logWriter, "fetch", "origin", "--tags", "--force"); err != nil {
+	if err := runGitRemote(b.repoURL, srcDir, logWriter, "fetch", "origin", "--tags", "--force"); err != nil {
 		return fmt.Errorf("git fetch failed: %w", err)
 	}
 	return nil
@@ -179,11 +197,11 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 		}
 	}
 
-	vcpkgRoot := os.Getenv("VCPKG_ROOT")
-	if vcpkgRoot == "" {
-		return nil, fmt.Errorf("VCPKG_ROOT environment variable is not set")
+	vcpkgDir, _ := filepath.Abs(b.vcpkgDir)
+	writeLog("Preparing vcpkg dependencies in %s from %s...", vcpkgDir, redactURL(b.vcpkgRepoURL))
+	if err := b.prepareVcpkg(srcDir, logFile); err != nil {
+		return nil, err
 	}
-	writeLog("VCPKG_ROOT=%s", vcpkgRoot)
 
 	if _, err := exec.LookPath("cargo"); err != nil {
 		return nil, fmt.Errorf("cargo not found in PATH")
@@ -281,6 +299,7 @@ func (b *PreBuilder) checkout(version string, logFile io.Writer) error {
 	if err := b.syncSource(logFile); err != nil {
 		return err
 	}
+	removeStaleLock(srcDir)
 	if err := b.runInDir(srcDir, logFile, "git", "checkout", "--force", version); err != nil {
 		return fmt.Errorf("git checkout %s failed: %v", version, err)
 	}
@@ -291,10 +310,29 @@ func (b *PreBuilder) checkout(version string, logFile io.Writer) error {
 	return nil
 }
 
+// buildEnv is the environment of every build command: the worker's own, with
+// VCPKG_ROOT at the worker's vcpkg clone and, when Jobs is set, the build
+// parallelism. Later entries win, so these override inherited values.
+func (b *PreBuilder) buildEnv() []string {
+	vcpkgDir, _ := filepath.Abs(b.vcpkgDir)
+	env := append(os.Environ(),
+		"VCPKG_ROOT="+vcpkgDir,
+		"VCPKG_DEFAULT_BINARY_CACHE="+filepath.Join(vcpkgDir, "binary-cache"),
+		"VCPKG_DISABLE_METRICS=1",
+	)
+	if b.jobs > 0 {
+		env = append(env,
+			fmt.Sprintf("CARGO_BUILD_JOBS=%d", b.jobs),
+			fmt.Sprintf("VCPKG_MAX_CONCURRENCY=%d", b.jobs),
+		)
+	}
+	return env
+}
+
 func (b *PreBuilder) runBuildCmd(dir string, logWriter io.Writer, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
-	cmd.Env = os.Environ()
+	cmd.Env = b.buildEnv()
 	cmd.Stdout = logWriter
 	cmd.Stderr = logWriter
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

@@ -194,9 +194,6 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 
 	// Step 1: flutter_rust_bridge codegen
 	writeLog("Step 1/4: Generating flutter_rust_bridge code...")
-	pubspecPath := filepath.Join(srcDir, "flutter", "pubspec.yaml")
-	_ = b.runBuildCmd(srcDir, logFile, "sed", "-i", // best-effort patch
-		"s/extended_text: 14.0.0/extended_text: 13.0.0/g", pubspecPath)
 	if err := b.runBuildCmd(filepath.Join(srcDir, "flutter"), logFile, "flutter", "pub", "get"); err != nil {
 		return nil, fmt.Errorf("flutter pub get failed: %v", err)
 	}
@@ -224,7 +221,6 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 		bridgeDart)
 
 	// Step 4: Build Flutter
-	_ = b.runBuildCmd(srcDir, logFile, "git", "checkout", "--", "flutter/pubspec.yaml") // best-effort restore
 	writeLog("Step 4/4: Building Flutter UI...")
 	if err := b.runBuildCmd(filepath.Join(srcDir, "flutter"), logFile, "flutter", "build", "linux", "--release"); err != nil {
 		return nil, fmt.Errorf("flutter build failed: %v", err)

@@ -36,7 +36,7 @@ func New(cfg *config.Config, apiClient *api.Client, s3Client *s3.Client) *Worker
 		s3Client:  s3Client,
 		preBuilder: builder.NewPreBuilder(
 			cfg.Build.RustdeskSrcDir,
-			cfg.Build.WorktreeDir,
+			cfg.Build.RustdeskRepoURL,
 			cfg.Build.LogDir,
 		),
 	}

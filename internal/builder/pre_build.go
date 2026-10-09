@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,21 +15,27 @@ import (
 	"time"
 )
 
-// PreBuilder handles compiling RustDesk from source.
+// PreBuilder handles compiling RustDesk from source. srcDir is a clone the
+// worker owns: it is created from repoURL when missing, and builds check out
+// and reset it freely, so it must never be a checkout someone works in.
 type PreBuilder struct {
-	srcDir      string
-	worktreeDir string
-	logDir      string
+	srcDir  string
+	repoURL string
+	logDir  string
 
 	mu        sync.Mutex
 	cancelCmd *exec.Cmd
+
+	// gitMu serialises clone/fetch/checkout in srcDir between the build and
+	// the periodic version refresh.
+	gitMu sync.Mutex
 }
 
-func NewPreBuilder(srcDir, worktreeDir, logDir string) *PreBuilder {
+func NewPreBuilder(srcDir, repoURL, logDir string) *PreBuilder {
 	return &PreBuilder{
-		srcDir:      srcDir,
-		worktreeDir: worktreeDir,
-		logDir:      logDir,
+		srcDir:  srcDir,
+		repoURL: repoURL,
+		logDir:  logDir,
 	}
 }
 
@@ -40,9 +47,48 @@ type BuildResult struct {
 
 var semverRe = regexp.MustCompile(`^\d+\.\d+\.\d+`)
 
-// ListVersions returns available git tags from the source tree.
+// versionRe is what a version handed to git must look like: a release tag,
+// never something git could read as an option.
+var versionRe = regexp.MustCompile(`^\d+\.\d+\.\d+[0-9A-Za-z.+-]*$`)
+
+func checkVersion(version string) error {
+	if !versionRe.MatchString(version) {
+		return fmt.Errorf("invalid version %q", version)
+	}
+	return nil
+}
+
+// syncSource clones repoURL into srcDir when it is not a git repository yet,
+// otherwise fetches new commits and tags. Callers hold gitMu.
+func (b *PreBuilder) syncSource(logWriter io.Writer) error {
+	srcDir, _ := filepath.Abs(b.srcDir)
+	if _, err := os.Stat(filepath.Join(srcDir, ".git")); err != nil {
+		if err := os.MkdirAll(filepath.Dir(srcDir), 0755); err != nil {
+			return fmt.Errorf("failed to create %s: %w", filepath.Dir(srcDir), err)
+		}
+		if err := b.runInDir("", logWriter, "git", "clone", b.repoURL, srcDir); err != nil {
+			return fmt.Errorf("git clone %s failed: %w", b.repoURL, err)
+		}
+		return nil
+	}
+	if err := b.runInDir(srcDir, logWriter, "git", "fetch", "origin", "--tags", "--force"); err != nil {
+		return fmt.Errorf("git fetch failed: %w", err)
+	}
+	return nil
+}
+
+// ListVersions fetches the source tree, cloning it on first use, and returns
+// its release tags, newest first. A failed fetch still lists the tags already
+// known.
 func (b *PreBuilder) ListVersions() ([]string, error) {
 	srcDir, _ := filepath.Abs(b.srcDir)
+
+	b.gitMu.Lock()
+	err := b.syncSource(nil)
+	b.gitMu.Unlock()
+	if err != nil {
+		log.Printf("Warning: syncing %s: %v", srcDir, err)
+	}
 
 	cmd := exec.Command("git", "-C", srcDir, "tag", "--list", "--sort=-version:refname")
 	out, err := cmd.Output()
@@ -68,8 +114,10 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 	if arch != "x86_64" && arch != "aarch64" {
 		return nil, fmt.Errorf("unsupported architecture: %s", arch)
 	}
+	if err := checkVersion(version); err != nil {
+		return nil, err
+	}
 
-	worktreeDir, _ := filepath.Abs(b.worktreeDir)
 	srcDir, _ := filepath.Abs(b.srcDir)
 
 	if err := os.MkdirAll(b.logDir, 0755); err != nil {
@@ -92,27 +140,14 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 
 	writeLog("Pre-build started: version=%s platform=%s arch=%s", version, platform, arch)
 
-	if err := b.ensureWorktree(srcDir, worktreeDir, writeLog); err != nil {
-		return nil, fmt.Errorf("worktree setup failed: %v", err)
-	}
-
-	writeLog("Fetching tags and checking out version %s...", version)
-	if err := b.runInDir(worktreeDir, logFile, "git", "fetch", "origin", "--tags"); err != nil {
-		return nil, fmt.Errorf("git fetch failed: %v", err)
-	}
-	if err := b.runInDir(worktreeDir, logFile, "git", "checkout", "--force", version); err != nil {
-		return nil, fmt.Errorf("git checkout %s failed: %v", version, err)
-	}
-	_ = b.runInDir(worktreeDir, logFile, "git", "clean", "-fd") // best-effort cleanup
-
-	writeLog("Initializing git submodules...")
-	if err := b.runInDir(worktreeDir, logFile, "git", "submodule", "update", "--init", "--recursive"); err != nil {
-		return nil, fmt.Errorf("git submodule update failed: %v", err)
+	writeLog("Syncing %s from %s and checking out version %s...", srcDir, b.repoURL, version)
+	if err := b.checkout(version, logFile); err != nil {
+		return nil, err
 	}
 
 	if pubKey != "" {
 		writeLog("Patching signing public key in common.rs...")
-		commonRsPath := filepath.Join(worktreeDir, "src", "common.rs")
+		commonRsPath := filepath.Join(srcDir, "src", "common.rs")
 		if err := patchPublicKey(commonRsPath, pubKey); err != nil {
 			return nil, fmt.Errorf("failed to patch public key: %v", err)
 		}
@@ -133,13 +168,13 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 
 	// Step 1: flutter_rust_bridge codegen
 	writeLog("Step 1/4: Generating flutter_rust_bridge code...")
-	pubspecPath := filepath.Join(worktreeDir, "flutter", "pubspec.yaml")
-	_ = b.runBuildCmd(worktreeDir, logFile, "sed", "-i", // best-effort patch
+	pubspecPath := filepath.Join(srcDir, "flutter", "pubspec.yaml")
+	_ = b.runBuildCmd(srcDir, logFile, "sed", "-i", // best-effort patch
 		"s/extended_text: 14.0.0/extended_text: 13.0.0/g", pubspecPath)
-	if err := b.runBuildCmd(filepath.Join(worktreeDir, "flutter"), logFile, "flutter", "pub", "get"); err != nil {
+	if err := b.runBuildCmd(filepath.Join(srcDir, "flutter"), logFile, "flutter", "pub", "get"); err != nil {
 		return nil, fmt.Errorf("flutter pub get failed: %v", err)
 	}
-	if err := b.runBuildCmd(worktreeDir, logFile,
+	if err := b.runBuildCmd(srcDir, logFile,
 		"flutter_rust_bridge_codegen",
 		"--rust-input", "./src/flutter_ffi.rs",
 		"--dart-output", "./flutter/lib/generated_bridge.dart",
@@ -151,25 +186,25 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 	// Step 2: Compile Rust library
 	features := "flutter"
 	writeLog("Step 2/4: Compiling Rust library...")
-	if err := b.runBuildCmd(worktreeDir, logFile, "cargo", "build", "--features", features, "--lib", "--release"); err != nil {
+	if err := b.runBuildCmd(srcDir, logFile, "cargo", "build", "--features", features, "--lib", "--release"); err != nil {
 		return nil, fmt.Errorf("cargo build failed: %v", err)
 	}
 
 	// Step 3: FFI bindgen workaround
 	writeLog("Step 3/4: Applying FFI bindgen workaround...")
-	bridgeDart := filepath.Join(worktreeDir, "flutter", "lib", "generated_bridge.dart")
-	_ = b.runBuildCmd(worktreeDir, logFile, "sed", "-i", // best-effort workaround
+	bridgeDart := filepath.Join(srcDir, "flutter", "lib", "generated_bridge.dart")
+	_ = b.runBuildCmd(srcDir, logFile, "sed", "-i", // best-effort workaround
 		"s/ffi.NativeFunction<ffi.Bool Function(DartPort/ffi.NativeFunction<ffi.Uint8 Function(DartPort/g",
 		bridgeDart)
 
 	// Step 4: Build Flutter
-	_ = b.runBuildCmd(worktreeDir, logFile, "git", "checkout", "--", "flutter/pubspec.yaml") // best-effort restore
+	_ = b.runBuildCmd(srcDir, logFile, "git", "checkout", "--", "flutter/pubspec.yaml") // best-effort restore
 	writeLog("Step 4/4: Building Flutter UI...")
-	if err := b.runBuildCmd(filepath.Join(worktreeDir, "flutter"), logFile, "flutter", "build", "linux", "--release"); err != nil {
+	if err := b.runBuildCmd(filepath.Join(srcDir, "flutter"), logFile, "flutter", "build", "linux", "--release"); err != nil {
 		return nil, fmt.Errorf("flutter build failed: %v", err)
 	}
 
-	buildOutputDir := GetBuildOutputDir(worktreeDir, platform)
+	buildOutputDir := GetBuildOutputDir(srcDir, platform)
 	if _, err := os.Stat(buildOutputDir); err != nil {
 		return nil, fmt.Errorf("build output folder not found: %s", buildOutputDir)
 	}
@@ -213,27 +248,23 @@ func (b *PreBuilder) GetLogContent(logPath string, offset int64) (string, int64,
 	return string(data), offset + int64(len(data)), nil
 }
 
-func (b *PreBuilder) ensureWorktree(srcDir, worktreeDir string, writeLog func(string, ...any)) error {
-	absSrc, _ := filepath.Abs(srcDir)
-	absWt, _ := filepath.Abs(worktreeDir)
+// checkout brings srcDir to `version`, with its submodules, discarding the
+// previous build's patches and untracked files.
+func (b *PreBuilder) checkout(version string, logFile io.Writer) error {
+	srcDir, _ := filepath.Abs(b.srcDir)
 
-	if _, err := os.Stat(absWt); err == nil {
-		if err := b.runInDir(absWt, nil, "git", "status"); err != nil {
-			writeLog("Existing worktree seems broken, removing and recreating...")
-			_ = os.RemoveAll(absWt)
-			_ = exec.Command("git", "-C", absSrc, "worktree", "remove", "--force", absWt).Run()
-		} else {
-			return nil
-		}
-	}
+	b.gitMu.Lock()
+	defer b.gitMu.Unlock()
 
-	writeLog("Creating build worktree at %s (source: %s)...", absWt, absSrc)
-	if err := os.MkdirAll(filepath.Dir(absWt), 0755); err != nil {
-		return fmt.Errorf("failed to create worktree parent dir: %w", err)
+	if err := b.syncSource(logFile); err != nil {
+		return err
 	}
-	cmd := exec.Command("git", "-C", absSrc, "worktree", "add", "--detach", absWt)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git worktree add failed: %w\n%s", err, string(out))
+	if err := b.runInDir(srcDir, logFile, "git", "checkout", "--force", version); err != nil {
+		return fmt.Errorf("git checkout %s failed: %v", version, err)
+	}
+	_ = b.runInDir(srcDir, logFile, "git", "clean", "-fd") // best-effort cleanup
+	if err := b.runInDir(srcDir, logFile, "git", "submodule", "update", "--init", "--recursive", "--force"); err != nil {
+		return fmt.Errorf("git submodule update failed: %v", err)
 	}
 	return nil
 }
@@ -283,15 +314,15 @@ func patchPublicKey(commonRsPath, pubKey string) error {
 }
 
 // GetBuildOutputDir returns the expected Flutter build output directory path.
-func GetBuildOutputDir(worktreeDir, platform string) string {
+func GetBuildOutputDir(srcDir, platform string) string {
 	switch platform {
 	case "linux":
-		return filepath.Join(worktreeDir, "flutter", "build", "linux", "x64", "release", "bundle")
+		return filepath.Join(srcDir, "flutter", "build", "linux", "x64", "release", "bundle")
 	case "windows":
-		return filepath.Join(worktreeDir, "flutter", "build", "windows", "x64", "runner", "Release")
+		return filepath.Join(srcDir, "flutter", "build", "windows", "x64", "runner", "Release")
 	case "macos":
-		return filepath.Join(worktreeDir, "flutter", "build", "macos", "Build", "Products", "Release")
+		return filepath.Join(srcDir, "flutter", "build", "macos", "Build", "Products", "Release")
 	default:
-		return filepath.Join(worktreeDir, "flutter", "build")
+		return filepath.Join(srcDir, "flutter", "build")
 	}
 }

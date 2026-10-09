@@ -29,8 +29,8 @@ type S3 struct {
 }
 
 type Build struct {
-	RustdeskSrcDir   string `mapstructure:"rustdesk-src-dir"`   // path to rustdesk/ source tree
-	WorktreeDir      string `mapstructure:"worktree-dir"`       // git worktree for isolated builds
+	RustdeskSrcDir   string `mapstructure:"rustdesk-src-dir"`   // the worker's own rustdesk clone, created if missing; never a checkout someone works in
+	RustdeskRepoURL  string `mapstructure:"rustdesk-repo-url"`  // where rustdesk-src-dir is cloned from
 	LogDir           string `mapstructure:"log-dir"`            // build log output
 	SigningPublicKey string `mapstructure:"signing-public-key"` // Ed25519 public key to patch into client
 }
@@ -50,7 +50,8 @@ func Load(path string) (*Config, error) {
 	v.SetConfigFile(path)
 	v.SetConfigType("yaml")
 
-	v.SetDefault("build.worktree-dir", "/tmp/build-worktree")
+	v.SetDefault("build.rustdesk-src-dir", "/var/lib/build-worker/rustdesk")
+	v.SetDefault("build.rustdesk-repo-url", "https://github.com/rustdesk/rustdesk.git")
 	v.SetDefault("build.log-dir", "/tmp/build-logs")
 
 	if err := v.ReadInConfig(); err != nil {

@@ -17,7 +17,9 @@ s3:
   use-ssl: false
 
 build:
-  rustdesk-src-dir: "/home/user/rustdesk/rustdesk"
-  worktree-dir: "/tmp/build-worktree"
+  # The worker's own clone: cloned from rustdesk-repo-url when missing and
+  # reset on every build, so never point it at a checkout you work in.
+  rustdesk-src-dir: "/var/lib/build-worker/rustdesk"
+  rustdesk-repo-url: "https://github.com/rustdesk/rustdesk.git"
   log-dir: "/tmp/build-logs"
   signing-public-key: "fjMWQpn+Kvu2hO6hRjIWyS8n55JITpevt0OzMBRIn4Q="

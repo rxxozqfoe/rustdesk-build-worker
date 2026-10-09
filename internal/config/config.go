@@ -30,7 +30,7 @@ type S3 struct {
 
 type Build struct {
 	RustdeskSrcDir   string `mapstructure:"rustdesk-src-dir"`   // the worker's own rustdesk clone, created if missing; never a checkout someone works in
-	RustdeskRepoURL  string `mapstructure:"rustdesk-repo-url"`  // where rustdesk-src-dir is cloned from
+	RustdeskRepoURL  string `mapstructure:"rustdesk-repo-url"`  // where rustdesk-src-dir is cloned from; for a private repo prefer a git credential helper over a token in the URL, which git keeps in the clone's .git/config
 	LogDir           string `mapstructure:"log-dir"`            // build log output
 	SigningPublicKey string `mapstructure:"signing-public-key"` // Ed25519 public key to patch into client
 }

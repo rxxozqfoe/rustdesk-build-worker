@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,6 +59,31 @@ func checkVersion(version string) error {
 	return nil
 }
 
+// redactURL hides any credentials in a repository URL, which would
+// otherwise reach the build log (uploaded to S3) and job errors.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<repository>"
+	}
+	if u.User != nil {
+		u.User = url.User("REDACTED")
+	}
+	return u.String()
+}
+
+// runGitRemote runs a git command that talks to repoURL. Its output can echo
+// the URL, so it is written to logWriter only with the URL redacted.
+func (b *PreBuilder) runGitRemote(dir string, logWriter io.Writer, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if logWriter != nil && len(out) > 0 {
+		_, _ = io.WriteString(logWriter, strings.ReplaceAll(string(out), b.repoURL, redactURL(b.repoURL)))
+	}
+	return err
+}
+
 // syncSource clones repoURL into srcDir when it is not a git repository yet,
 // otherwise fetches new commits and tags. Callers hold gitMu.
 func (b *PreBuilder) syncSource(logWriter io.Writer) error {
@@ -66,12 +92,12 @@ func (b *PreBuilder) syncSource(logWriter io.Writer) error {
 		if err := os.MkdirAll(filepath.Dir(srcDir), 0755); err != nil {
 			return fmt.Errorf("failed to create %s: %w", filepath.Dir(srcDir), err)
 		}
-		if err := b.runInDir("", logWriter, "git", "clone", b.repoURL, srcDir); err != nil {
-			return fmt.Errorf("git clone %s failed: %w", b.repoURL, err)
+		if err := b.runGitRemote("", logWriter, "clone", b.repoURL, srcDir); err != nil {
+			return fmt.Errorf("git clone %s failed: %w", redactURL(b.repoURL), err)
 		}
 		return nil
 	}
-	if err := b.runInDir(srcDir, logWriter, "git", "fetch", "origin", "--tags", "--force"); err != nil {
+	if err := b.runGitRemote(srcDir, logWriter, "fetch", "origin", "--tags", "--force"); err != nil {
 		return fmt.Errorf("git fetch failed: %w", err)
 	}
 	return nil
@@ -140,7 +166,7 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 
 	writeLog("Pre-build started: version=%s platform=%s arch=%s", version, platform, arch)
 
-	writeLog("Syncing %s from %s and checking out version %s...", srcDir, b.repoURL, version)
+	writeLog("Syncing %s from %s and checking out version %s...", srcDir, redactURL(b.repoURL), version)
 	if err := b.checkout(version, logFile); err != nil {
 		return nil, err
 	}

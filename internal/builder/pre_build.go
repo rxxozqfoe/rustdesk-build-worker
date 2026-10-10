@@ -116,6 +116,9 @@ func (b *PreBuilder) syncSource(logWriter io.Writer) error {
 		return nil
 	}
 	removeStaleLocks(srcDir)
+	if err := setOrigin(srcDir, b.repoURL); err != nil {
+		return err
+	}
 	if err := runGitRemote(b.repoURL, srcDir, logWriter, "fetch", "origin", "--tags", "--force"); err != nil {
 		return fmt.Errorf("git fetch failed: %w", err)
 	}

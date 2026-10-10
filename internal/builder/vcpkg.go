@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -56,6 +57,18 @@ func removeStaleLocks(repoDir string) {
 	})
 }
 
+// setOrigin points an existing clone's origin at the configured URL, so a
+// changed mirror or rotated credentials apply to clones already on the
+// volume. It prints nothing, so the URL cannot reach the log.
+func setOrigin(repoDir, repoURL string) error {
+	cmd := exec.Command("git", "remote", "set-url", "origin", repoURL)
+	cmd.Dir = repoDir
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("setting origin of %s to %s failed: %w", repoDir, redactURL(repoURL), err)
+	}
+	return nil
+}
+
 // prepareVcpkg brings the worker's vcpkg clone to the baseline the release in
 // srcDir pins and installs that release's dependencies into
 // <vcpkgDir>/installed. Packages built before come from the binary cache.
@@ -98,6 +111,9 @@ func (b *PreBuilder) syncVcpkg(vcpkgDir, baseline string, logFile io.Writer) err
 		}
 	}
 	removeStaleLocks(vcpkgDir)
+	if err := setOrigin(vcpkgDir, b.vcpkgRepoURL); err != nil {
+		return err
+	}
 	if err := b.runInDir(vcpkgDir, nil, "git", "cat-file", "-e", baseline+"^{commit}"); err != nil {
 		if err := runGitRemote(b.vcpkgRepoURL, vcpkgDir, logFile, "fetch", "origin"); err != nil {
 			return fmt.Errorf("vcpkg fetch failed: %w", err)

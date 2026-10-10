@@ -119,11 +119,15 @@ jobs:
   # The awk step fills that gap.
   # -------------------------------------------------------------------
   lint-dockerfile:
-    name: Lint Dockerfile (hadolint + digest pin)
+    name: Lint ${{ matrix.dockerfile }} (hadolint + digest pin)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: [Dockerfile, Dockerfile.builder]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -131,20 +135,22 @@ jobs:
       - name: Run hadolint
         uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
-          dockerfile: Dockerfile
+          dockerfile: ${{ matrix.dockerfile }}
           config: .hadolint.yaml
           failure-threshold: warning
 
       - name: Enforce FROM @sha256 digest pin
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
         run: |
           set -euo pipefail
-          unpinned=$(awk '/^FROM/ && $0 !~ /@sha256:[a-f0-9]{64}/ {print NR ": " $0}' Dockerfile || true)
+          unpinned=$(awk '/^FROM/ && $0 !~ /@sha256:[a-f0-9]{64}/ {print NR ": " $0}' "$DOCKERFILE" || true)
           if [ -n "$unpinned" ]; then
-            echo "::error::Unpinned FROM instruction(s) detected:"
+            echo "::error::Unpinned FROM instruction(s) in $DOCKERFILE:"
             echo "$unpinned"
             exit 1
           fi
-          echo "All FROM instructions are pinned to a digest."
+          echo "All FROM instructions in $DOCKERFILE are pinned to a digest."
 
   # -------------------------------------------------------------------
   # Verify cosign/sigstore signatures of the pinned base images against
@@ -164,7 +170,11 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       - name: Verify all FROM base images against policy
-        run: bash .github/scripts/verify-base-images.sh Dockerfile
+        run: |
+          set -euo pipefail
+          for f in Dockerfile Dockerfile.builder; do
+            bash .github/scripts/verify-base-images.sh "$f"
+          done
 
   # -------------------------------------------------------------------
   # Trivy CVE scan. Builds an amd64 image into the local daemon (no
@@ -232,3 +242,99 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
           category: trivy
+
+  # -------------------------------------------------------------------
+  # Trivy scan of the builder image (Dockerfile.builder). Building it takes
+  # ~15 minutes, so a PR or branch push scans only when the builder's inputs
+  # changed; a tag (publish) always scans. Same two passes as `scan`, with
+  # .trivyignore.builder for user-approved, expiring exceptions inside
+  # vendored toolchains.
+  # -------------------------------------------------------------------
+  scan-builder:
+    name: Trivy CVE scan (builder image)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether the builder image needs a scan
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = tag ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$EVENT" = pull_request ]; then
+            changed=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+          else
+            changed=$(git diff --name-only HEAD^ HEAD)
+          fi
+          if grep -qE '^(Dockerfile\.builder|\.trivyignore\.builder|config\.yaml|go\.(mod|sum)|\.github/workflows/_validate\.yml)$' <<< "$changed"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Builder inputs unchanged; skipping the builder scan."
+          fi
+
+      - name: Free runner disk space
+        if: steps.decide.outputs.run == 'true'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Set up Docker Buildx
+        if: steps.decide.outputs.run == 'true'
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build local builder image for scanning
+        if: steps.decide.outputs.run == 'true'
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: ./Dockerfile.builder
+          platforms: linux/amd64
+          load: true
+          tags: local/scan-builder:${{ github.sha }}
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=min,scope=builder
+
+      - name: Trivy scan — block on CRITICAL/HIGH
+        if: steps.decide.outputs.run == 'true'
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: local/scan-builder:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          trivyignores: .trivyignore.builder
+          timeout: 30m
+
+      - name: Trivy scan — full SARIF report (all severities)
+        if: always() && steps.decide.outputs.run == 'true'
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: local/scan-builder:${{ github.sha }}
+          format: sarif
+          output: trivy-builder.sarif
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: os,library
+          trivyignores: .trivyignore.builder
+          timeout: 30m
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: always() && steps.decide.outputs.run == 'true'
+        uses: github/codeql-action/upload-sarif@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+        with:
+          sarif_file: trivy-builder.sarif
+          category: trivy-builder

@@ -24,6 +24,14 @@
     {
       "match": "docker.io/library/golang",
       "reason": "Same as above (fully qualified form)."
+    },
+    {
+      "match": "ubuntu",
+      "reason": "Docker Official Image used as the builder image's runtime base (Dockerfile.builder); it has no sigstore signature we can verify. Relies on digest pinning, Renovate digest bumps and the builder Trivy scan."
+    },
+    {
+      "match": "docker.io/library/ubuntu",
+      "reason": "Same as above (fully qualified form)."
     }
   ]
 }

@@ -34,9 +34,10 @@ name: publish
 #   - Sigstore (actions/attest-build-provenance), verifiable via
 #     `gh attestation verify` — cryptographic, identity-bound provenance.
 #
-# The published image ships only the worker BINARY. The heavy RustDesk
-# build toolchain the worker shells out to at run time is NOT baked in; it
-# is expected to be provided by the runtime environment.
+# The main image ships only the worker BINARY. A second, amd64-only image,
+# <version>-builder (Dockerfile.builder), carries the RustDesk build
+# toolchain the worker shells out to; build-builder / verify-builder below
+# publish and check it the same way.
 
 on:
   push:
@@ -316,6 +317,129 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.merge.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${IMAGE_DIGEST_REF}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish.yml"
+
+  # -------------------------------------------------------------------
+  # Builder image (Dockerfile.builder): amd64 only, pushed as
+  # <version>-builder, then signed and attested like the slim image and
+  # smoke-tested for the toolchain the worker shells out to.
+  # -------------------------------------------------------------------
+  build-builder:
+    name: Build, sign and attest builder image
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (builder tags)
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},suffix=-builder
+          flavor: |
+            latest=false
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: ./Dockerfile.builder
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=min,scope=builder
+          sbom: true
+          provenance: mode=max
+          push: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_YES: "true"
+          IMAGE_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: cosign sign "$IMAGE_DIGEST_REF"
+
+      - name: Attest build provenance (Sigstore-signed SLSA)
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Smoke test the toolchain
+        env:
+          IMAGE_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint bash "$IMAGE_DIGEST_REF" -c \
+            'cargo --version && rustc --version && rustfmt --version && flutter --version && flutter_rust_bridge_codegen --version && /app/build-worker --help > /dev/null && test "$(id -u)" = 65532'
+
+  verify-builder:
+    name: Verify builder signature and provenance
+    runs-on: ubuntu-24.04
+    needs: build-builder
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify signature
+        env:
+          IMAGE_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-builder.outputs.digest }}
+          IDENTITY_REGEXP: ^https://github\.com/${{ github.repository }}/\.github/workflows/publish\.yml@refs/tags/v.+
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
+            --certificate-identity-regexp="$IDENTITY_REGEXP" \
+            "$IMAGE_DIGEST_REF"
+
+      - name: Verify SLSA build provenance attestation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-builder.outputs.digest }}
         run: |
           set -euo pipefail
           gh attestation verify "oci://${IMAGE_DIGEST_REF}" \

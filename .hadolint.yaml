@@ -27,6 +27,7 @@ override:
     - DL3024  # FROM aliases must be unique
     - DL3026  # Use only official/trusted FROM images
 
+# Dockerfile.builder's runtime base is docker.io/library/ubuntu (Docker Official Image, digest-pinned).
 trustedRegistries:
   - docker.io
   - cgr.dev

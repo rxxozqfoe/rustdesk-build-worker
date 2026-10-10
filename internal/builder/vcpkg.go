@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -72,7 +73,7 @@ func setOrigin(repoDir, repoURL string) error {
 // prepareVcpkg brings the worker's vcpkg clone to the baseline the release in
 // srcDir pins and installs that release's dependencies into
 // <vcpkgDir>/installed. Packages built before come from the binary cache.
-func (b *PreBuilder) prepareVcpkg(srcDir string, logFile io.Writer) error {
+func (b *PreBuilder) prepareVcpkg(ctx context.Context, srcDir string, logFile io.Writer) error {
 	baseline, err := vcpkgBaseline(srcDir)
 	if err != nil {
 		return err
@@ -80,7 +81,7 @@ func (b *PreBuilder) prepareVcpkg(srcDir string, logFile io.Writer) error {
 	vcpkgDir, _ := filepath.Abs(b.vcpkgDir)
 
 	b.gitMu.Lock()
-	err = b.syncVcpkg(vcpkgDir, baseline, logFile)
+	err = b.syncVcpkg(ctx, vcpkgDir, baseline, logFile)
 	b.gitMu.Unlock()
 	if err != nil {
 		return err
@@ -89,10 +90,10 @@ func (b *PreBuilder) prepareVcpkg(srcDir string, logFile io.Writer) error {
 	if err := os.MkdirAll(filepath.Join(vcpkgDir, "binary-cache"), 0755); err != nil {
 		return fmt.Errorf("creating the vcpkg binary cache: %w", err)
 	}
-	if err := b.runBuildCmd(vcpkgDir, logFile, filepath.Join(vcpkgDir, "bootstrap-vcpkg.sh"), "-disableMetrics"); err != nil {
+	if err := b.runBuildCmd(ctx, vcpkgDir, logFile, filepath.Join(vcpkgDir, "bootstrap-vcpkg.sh"), "-disableMetrics"); err != nil {
 		return fmt.Errorf("vcpkg bootstrap failed: %v", err)
 	}
-	if err := b.runBuildCmd(srcDir, logFile, filepath.Join(vcpkgDir, "vcpkg"), "install",
+	if err := b.runBuildCmd(ctx, srcDir, logFile, filepath.Join(vcpkgDir, "vcpkg"), "install",
 		"--x-install-root="+filepath.Join(vcpkgDir, "installed"), "--clean-after-build"); err != nil {
 		return fmt.Errorf("vcpkg install failed: %v", err)
 	}
@@ -101,12 +102,12 @@ func (b *PreBuilder) prepareVcpkg(srcDir string, logFile io.Writer) error {
 
 // syncVcpkg clones vcpkgRepoURL into vcpkgDir when missing, fetches when the
 // baseline is not there yet, and checks the baseline out. Callers hold gitMu.
-func (b *PreBuilder) syncVcpkg(vcpkgDir, baseline string, logFile io.Writer) error {
+func (b *PreBuilder) syncVcpkg(ctx context.Context, vcpkgDir, baseline string, logFile io.Writer) error {
 	if _, err := os.Stat(filepath.Join(vcpkgDir, ".git")); err != nil {
 		if err := os.MkdirAll(filepath.Dir(vcpkgDir), 0755); err != nil {
 			return fmt.Errorf("failed to create %s: %w", filepath.Dir(vcpkgDir), err)
 		}
-		if err := runGitRemote(b.vcpkgRepoURL, "", logFile, "clone", b.vcpkgRepoURL, vcpkgDir); err != nil {
+		if err := runGitRemote(ctx, b.vcpkgRepoURL, "", logFile, "clone", b.vcpkgRepoURL, vcpkgDir); err != nil {
 			return fmt.Errorf("vcpkg clone %s failed: %w", redactURL(b.vcpkgRepoURL), err)
 		}
 	}
@@ -114,12 +115,12 @@ func (b *PreBuilder) syncVcpkg(vcpkgDir, baseline string, logFile io.Writer) err
 	if err := setOrigin(vcpkgDir, b.vcpkgRepoURL); err != nil {
 		return err
 	}
-	if err := b.runInDir(vcpkgDir, nil, "git", "cat-file", "-e", baseline+"^{commit}"); err != nil {
-		if err := runGitRemote(b.vcpkgRepoURL, vcpkgDir, logFile, "fetch", "origin"); err != nil {
+	if err := b.runInDir(ctx, vcpkgDir, nil, "git", "cat-file", "-e", baseline+"^{commit}"); err != nil {
+		if err := runGitRemote(ctx, b.vcpkgRepoURL, vcpkgDir, logFile, "fetch", "origin"); err != nil {
 			return fmt.Errorf("vcpkg fetch failed: %w", err)
 		}
 	}
-	if err := b.runInDir(vcpkgDir, logFile, "git", "checkout", "--force", "--detach", baseline); err != nil {
+	if err := b.runInDir(ctx, vcpkgDir, logFile, "git", "checkout", "--force", "--detach", baseline); err != nil {
 		return fmt.Errorf("vcpkg checkout %s failed: %v", baseline, err)
 	}
 	return nil

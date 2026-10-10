@@ -2,6 +2,8 @@ package builder
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,8 +42,8 @@ type PreBuilder struct {
 	logDir       string
 	jobs         int
 
-	mu        sync.Mutex
-	cancelCmd *exec.Cmd
+	mu          sync.Mutex
+	cancelBuild context.CancelFunc // cancels the running build's commands
 
 	// gitMu serialises clone/fetch/checkout in srcDir and vcpkgDir between
 	// the build and the periodic version refresh.
@@ -90,11 +93,41 @@ func redactURL(raw string) string {
 	return u.String()
 }
 
+// errBuildCancelled is what Build returns once Cancel stopped it.
+var errBuildCancelled = errors.New("build cancelled")
+
+// maxLogs is how many pre-build logs Build keeps in the log dir.
+const maxLogs = 20
+
+// command prepares name in its own process group, bound to ctx: cancelling ctx
+// terminates the whole group (git and its helpers, cargo and its rustc).
+func command(ctx context.Context, dir, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
+	return cmd
+}
+
+// gitNetEnv is the environment of git commands that use the network: unless
+// the worker's environment sets them, a transfer slower than 1 KB/s for five
+// minutes is aborted, so a stalled connection cannot hold gitMu (and every
+// build) indefinitely.
+func gitNetEnv() []string {
+	env := os.Environ()
+	for _, kv := range [][2]string{{"GIT_HTTP_LOW_SPEED_LIMIT", "1000"}, {"GIT_HTTP_LOW_SPEED_TIME", "300"}} {
+		if _, set := os.LookupEnv(kv[0]); !set {
+			env = append(env, kv[0]+"="+kv[1])
+		}
+	}
+	return env
+}
+
 // runGitRemote runs a git command that talks to repoURL. Its output can echo
 // the URL, so it is written to logWriter only with the URL redacted.
-func runGitRemote(repoURL, dir string, logWriter io.Writer, args ...string) error {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
+func runGitRemote(ctx context.Context, repoURL, dir string, logWriter io.Writer, args ...string) error {
+	cmd := command(ctx, dir, "git", args...)
+	cmd.Env = gitNetEnv()
 	out, err := cmd.CombinedOutput()
 	if logWriter != nil && len(out) > 0 {
 		_, _ = io.WriteString(logWriter, strings.ReplaceAll(string(out), repoURL, redactURL(repoURL)))
@@ -104,13 +137,13 @@ func runGitRemote(repoURL, dir string, logWriter io.Writer, args ...string) erro
 
 // syncSource clones repoURL into srcDir when it is not a git repository yet,
 // otherwise fetches new commits and tags. Callers hold gitMu.
-func (b *PreBuilder) syncSource(logWriter io.Writer) error {
+func (b *PreBuilder) syncSource(ctx context.Context, logWriter io.Writer) error {
 	srcDir, _ := filepath.Abs(b.srcDir)
 	if _, err := os.Stat(filepath.Join(srcDir, ".git")); err != nil {
 		if err := os.MkdirAll(filepath.Dir(srcDir), 0755); err != nil {
 			return fmt.Errorf("failed to create %s: %w", filepath.Dir(srcDir), err)
 		}
-		if err := runGitRemote(b.repoURL, "", logWriter, "clone", b.repoURL, srcDir); err != nil {
+		if err := runGitRemote(ctx, b.repoURL, "", logWriter, "clone", b.repoURL, srcDir); err != nil {
 			return fmt.Errorf("git clone %s failed: %w", redactURL(b.repoURL), err)
 		}
 		return nil
@@ -119,7 +152,7 @@ func (b *PreBuilder) syncSource(logWriter io.Writer) error {
 	if err := setOrigin(srcDir, b.repoURL); err != nil {
 		return err
 	}
-	if err := runGitRemote(b.repoURL, srcDir, logWriter, "fetch", "origin", "--tags", "--force"); err != nil {
+	if err := runGitRemote(ctx, b.repoURL, srcDir, logWriter, "fetch", "origin", "--tags", "--force"); err != nil {
 		return fmt.Errorf("git fetch failed: %w", err)
 	}
 	return nil
@@ -134,7 +167,7 @@ func (b *PreBuilder) ListVersions() ([]string, error) {
 	// git's (redacted) output goes to the worker log, so a failed first
 	// clone says why.
 	b.gitMu.Lock()
-	err := b.syncSource(log.Writer())
+	err := b.syncSource(context.Background(), log.Writer())
 	b.gitMu.Unlock()
 	if err != nil {
 		log.Printf("Warning: syncing %s: %v", srcDir, err)
@@ -159,7 +192,9 @@ func (b *PreBuilder) ListVersions() ([]string, error) {
 // Build executes the full build pipeline and returns the output directory.
 // onLog, when set, receives the path of this build's log as soon as the file
 // exists, so the caller can stream it while the build runs.
-func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(logPath string)) (*BuildResult, error) {
+// Cancel stops it: the running command is terminated and Build returns
+// errBuildCancelled.
+func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(logPath string)) (_ *BuildResult, err error) {
 	if platform != "linux" {
 		return nil, fmt.Errorf("only linux platform is supported for builds")
 	}
@@ -169,6 +204,22 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(lo
 	if err := checkVersion(version); err != nil {
 		return nil, err
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	b.mu.Lock()
+	b.cancelBuild = cancel
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.cancelBuild = nil
+		b.mu.Unlock()
+		cancel()
+	}()
+	defer func() {
+		if err != nil && ctx.Err() != nil {
+			err = errBuildCancelled
+		}
+	}()
 
 	srcDir, _ := filepath.Abs(b.srcDir)
 
@@ -182,6 +233,7 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(lo
 		return nil, fmt.Errorf("failed to create log file: %v", err)
 	}
 	defer func() { _ = logFile.Close() }()
+	pruneLogs(b.logDir, maxLogs)
 	if onLog != nil {
 		onLog(logPath)
 	}
@@ -196,7 +248,7 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(lo
 	writeLog("Pre-build started: version=%s platform=%s arch=%s", version, platform, arch)
 
 	writeLog("Syncing %s from %s and checking out version %s...", srcDir, redactURL(b.repoURL), version)
-	if err := b.checkout(version, logFile); err != nil {
+	if err := b.checkout(ctx, version, logFile); err != nil {
 		return nil, err
 	}
 
@@ -210,7 +262,7 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(lo
 
 	vcpkgDir, _ := filepath.Abs(b.vcpkgDir)
 	writeLog("Preparing vcpkg dependencies in %s from %s...", vcpkgDir, redactURL(b.vcpkgRepoURL))
-	if err := b.prepareVcpkg(srcDir, logFile); err != nil {
+	if err := b.prepareVcpkg(ctx, srcDir, logFile); err != nil {
 		return nil, err
 	}
 
@@ -223,10 +275,10 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(lo
 
 	// Step 1: flutter_rust_bridge codegen
 	writeLog("Step 1/4: Generating flutter_rust_bridge code...")
-	if err := b.runBuildCmd(filepath.Join(srcDir, "flutter"), logFile, "flutter", "pub", "get"); err != nil {
+	if err := b.runBuildCmd(ctx, filepath.Join(srcDir, "flutter"), logFile, "flutter", "pub", "get"); err != nil {
 		return nil, fmt.Errorf("flutter pub get failed: %v", err)
 	}
-	if err := b.runBuildCmd(srcDir, logFile,
+	if err := b.runBuildCmd(ctx, srcDir, logFile,
 		"flutter_rust_bridge_codegen",
 		"--rust-input", "./src/flutter_ffi.rs",
 		"--dart-output", "./flutter/lib/generated_bridge.dart",
@@ -238,20 +290,20 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(lo
 	// Step 2: Compile Rust library
 	features := "flutter"
 	writeLog("Step 2/4: Compiling Rust library...")
-	if err := b.runBuildCmd(srcDir, logFile, "cargo", "build", "--features", features, "--lib", "--release"); err != nil {
+	if err := b.runBuildCmd(ctx, srcDir, logFile, "cargo", "build", "--features", features, "--lib", "--release"); err != nil {
 		return nil, fmt.Errorf("cargo build failed: %v", err)
 	}
 
 	// Step 3: FFI bindgen workaround
 	writeLog("Step 3/4: Applying FFI bindgen workaround...")
 	bridgeDart := filepath.Join(srcDir, "flutter", "lib", "generated_bridge.dart")
-	_ = b.runBuildCmd(srcDir, logFile, "sed", "-i", // best-effort workaround
+	_ = b.runBuildCmd(ctx, srcDir, logFile, "sed", "-i", // best-effort workaround
 		"s/ffi.NativeFunction<ffi.Bool Function(DartPort/ffi.NativeFunction<ffi.Uint8 Function(DartPort/g",
 		bridgeDart)
 
 	// Step 4: Build Flutter
 	writeLog("Step 4/4: Building Flutter UI...")
-	if err := b.runBuildCmd(filepath.Join(srcDir, "flutter"), logFile, "flutter", "build", "linux", "--release"); err != nil {
+	if err := b.runBuildCmd(ctx, filepath.Join(srcDir, "flutter"), logFile, "flutter", "build", "linux", "--release"); err != nil {
 		return nil, fmt.Errorf("flutter build failed: %v", err)
 	}
 
@@ -264,14 +316,40 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(lo
 	return &BuildResult{OutputDir: buildOutputDir, LogPath: logPath}, nil
 }
 
-// Cancel terminates the currently running build command.
+// Cancel stops the running build: its current command (git, vcpkg, cargo,
+// flutter) is terminated and no further step starts.
 func (b *PreBuilder) Cancel() {
 	b.mu.Lock()
-	cmd := b.cancelCmd
+	cancel := b.cancelBuild
 	b.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
 
-	if cmd != nil && cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+// pruneLogs keeps the newest keep pre-build logs in dir; the log dir lives on
+// the worker's volume and would otherwise grow without bound.
+func pruneLogs(dir string, keep int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type logFile struct {
+		path string
+		mod  time.Time
+	}
+	var logs []logFile
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), "prebuild_") || !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			logs = append(logs, logFile{filepath.Join(dir, e.Name()), info.ModTime()})
+		}
+	}
+	sort.Slice(logs, func(i, j int) bool { return logs[i].mod.After(logs[j].mod) })
+	for i := keep; i < len(logs); i++ {
+		_ = os.Remove(logs[i].path)
 	}
 }
 
@@ -301,20 +379,21 @@ func (b *PreBuilder) GetLogContent(logPath string, offset int64) (string, int64,
 
 // checkout brings srcDir to `version`, with its submodules, discarding the
 // previous build's patches and untracked files.
-func (b *PreBuilder) checkout(version string, logFile io.Writer) error {
+func (b *PreBuilder) checkout(ctx context.Context, version string, logFile io.Writer) error {
 	srcDir, _ := filepath.Abs(b.srcDir)
 
 	b.gitMu.Lock()
 	defer b.gitMu.Unlock()
 
-	if err := b.syncSource(logFile); err != nil {
+	if err := b.syncSource(ctx, logFile); err != nil {
 		return err
 	}
-	if err := b.runInDir(srcDir, logFile, "git", "checkout", "--force", version); err != nil {
+	if err := b.runInDir(ctx, srcDir, logFile, "git", "checkout", "--force", version); err != nil {
 		return fmt.Errorf("git checkout %s failed: %v", version, err)
 	}
-	_ = b.runInDir(srcDir, logFile, "git", "clean", "-fd") // best-effort cleanup
-	if err := b.runInDir(srcDir, logFile, "git", "submodule", "update", "--init", "--recursive", "--force"); err != nil {
+	_ = b.runInDir(ctx, srcDir, logFile, "git", "clean", "-fd") // best-effort cleanup
+	// Submodules are fetched over the network.
+	if err := runGitRemote(ctx, b.repoURL, srcDir, logFile, "submodule", "update", "--init", "--recursive", "--force"); err != nil {
 		return fmt.Errorf("git submodule update failed: %v", err)
 	}
 	return nil
@@ -339,30 +418,16 @@ func (b *PreBuilder) buildEnv() []string {
 	return env
 }
 
-func (b *PreBuilder) runBuildCmd(dir string, logWriter io.Writer, name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
+func (b *PreBuilder) runBuildCmd(ctx context.Context, dir string, logWriter io.Writer, name string, args ...string) error {
+	cmd := command(ctx, dir, name, args...)
 	cmd.Env = b.buildEnv()
 	cmd.Stdout = logWriter
 	cmd.Stderr = logWriter
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	b.mu.Lock()
-	b.cancelCmd = cmd
-	b.mu.Unlock()
-
-	err := cmd.Run()
-
-	b.mu.Lock()
-	b.cancelCmd = nil
-	b.mu.Unlock()
-
-	return err
+	return cmd.Run()
 }
 
-func (b *PreBuilder) runInDir(dir string, logWriter io.Writer, name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
+func (b *PreBuilder) runInDir(ctx context.Context, dir string, logWriter io.Writer, name string, args ...string) error {
+	cmd := command(ctx, dir, name, args...)
 	if logWriter != nil {
 		cmd.Stdout = logWriter
 		cmd.Stderr = logWriter

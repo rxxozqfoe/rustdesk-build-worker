@@ -246,7 +246,8 @@ jobs:
   # -------------------------------------------------------------------
   # Trivy scan of the builder image (Dockerfile.builder). Building it takes
   # ~15 minutes, so a PR or branch push scans only when the builder's inputs
-  # changed; a tag (publish) always scans. Same two passes as `scan`, with
+  # changed; a tag (publish) and the weekly schedule (new apt CVEs) always
+  # scan. Same two passes as `scan`, with
   # .trivyignore.builder for user-approved, expiring exceptions inside
   # vendored toolchains.
   # -------------------------------------------------------------------
@@ -269,13 +270,17 @@ jobs:
           EVENT: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          if [ "$REF_TYPE" = tag ]; then
+          if [ "$REF_TYPE" = tag ] || [ "$EVENT" = schedule ] || [ "$EVENT" = workflow_dispatch ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
           if [ "$EVENT" = pull_request ]; then
             changed=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+          elif [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            # The whole push, not just its last commit.
+            changed=$(git diff --name-only "$BEFORE" HEAD)
           else
             changed=$(git diff --name-only HEAD^ HEAD)
           fi

@@ -105,6 +105,16 @@
       "matchUpdateTypes": ["major"],
       "dependencyDashboardApproval": true,
       "labels": ["dependencies", "major-update"]
+    },
+    // Dockerfile.builder's ubuntu:22.04 sets the glibc floor (2.35) of every
+    // client the worker builds; a newer release would silently raise it and
+    // break clients on Ubuntu 22.04 / Debian 12. Only digest updates of 22.04
+    // are proposed; moving off 22.04 is a deliberate, manual change.
+    {
+      "description": "Keep the builder image on Ubuntu 22.04 (client glibc floor).",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["ubuntu"],
+      "allowedVersions": "22.04"
     }
   ]
 }

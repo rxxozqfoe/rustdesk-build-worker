@@ -18,6 +18,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly, so CVEs published against unchanged images (e.g. new apt
+  # advisories for the builder's Ubuntu packages) surface before a release.
+  schedule:
+    - cron: "0 3 * * 1"
 
 # Collapse redundant runs on the same ref. On a PR, a new push cancels the
 # previous still-running validation (cancel-in-progress). On a push to main

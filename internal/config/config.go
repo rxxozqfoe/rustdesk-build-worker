@@ -31,6 +31,9 @@ type S3 struct {
 type Build struct {
 	RustdeskSrcDir   string `mapstructure:"rustdesk-src-dir"`   // the worker's own rustdesk clone, created if missing; never a checkout someone works in
 	RustdeskRepoURL  string `mapstructure:"rustdesk-repo-url"`  // where rustdesk-src-dir is cloned from; for a private repo prefer a git credential helper over a token in the URL, which git keeps in the clone's .git/config
+	VcpkgDir         string `mapstructure:"vcpkg-dir"`          // the worker's own vcpkg clone, created if missing and checked out at each release's baseline
+	VcpkgRepoURL     string `mapstructure:"vcpkg-repo-url"`     // where vcpkg-dir is cloned from; same credential advice as rustdesk-repo-url
+	Jobs             int    `mapstructure:"jobs"`               // build parallelism (CARGO_BUILD_JOBS / VCPKG_MAX_CONCURRENCY); 0 = tool defaults
 	LogDir           string `mapstructure:"log-dir"`            // build log output
 	SigningPublicKey string `mapstructure:"signing-public-key"` // Ed25519 public key to patch into client
 }
@@ -52,6 +55,9 @@ func Load(path string) (*Config, error) {
 
 	v.SetDefault("build.rustdesk-src-dir", "/var/lib/build-worker/rustdesk")
 	v.SetDefault("build.rustdesk-repo-url", "https://github.com/rustdesk/rustdesk.git")
+	v.SetDefault("build.vcpkg-dir", "/var/lib/build-worker/vcpkg")
+	v.SetDefault("build.vcpkg-repo-url", "https://github.com/microsoft/vcpkg.git")
+	v.SetDefault("build.jobs", 0)
 	v.SetDefault("build.log-dir", "/tmp/build-logs")
 
 	if err := v.ReadInConfig(); err != nil {

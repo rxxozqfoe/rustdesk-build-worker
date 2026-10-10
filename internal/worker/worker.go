@@ -34,11 +34,14 @@ func New(cfg *config.Config, apiClient *api.Client, s3Client *s3.Client) *Worker
 		cfg:       cfg,
 		apiClient: apiClient,
 		s3Client:  s3Client,
-		preBuilder: builder.NewPreBuilder(
-			cfg.Build.RustdeskSrcDir,
-			cfg.Build.RustdeskRepoURL,
-			cfg.Build.LogDir,
-		),
+		preBuilder: builder.NewPreBuilder(builder.Options{
+			SrcDir:       cfg.Build.RustdeskSrcDir,
+			RepoURL:      cfg.Build.RustdeskRepoURL,
+			VcpkgDir:     cfg.Build.VcpkgDir,
+			VcpkgRepoURL: cfg.Build.VcpkgRepoURL,
+			LogDir:       cfg.Build.LogDir,
+			Jobs:         cfg.Build.Jobs,
+		}),
 	}
 }
 
@@ -52,19 +55,13 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 	log.Printf("Registered as %q with platforms: %v", w.cfg.Worker.Name, w.cfg.Worker.Platforms)
 
-	// 2. Push initial versions
-	if versions, err := w.preBuilder.ListVersions(); err == nil && len(versions) > 0 {
-		if err := w.apiClient.PushVersions(w.cfg.Worker.Name, versions); err != nil {
-			log.Printf("Warning: failed to push versions: %v", err)
-		} else {
-			log.Printf("Pushed %d versions", len(versions))
-		}
-	}
-
-	// 3. Start heartbeat goroutine (every 5s, timeout is 15s on API side)
+	// 2. Start heartbeat goroutine (every 5s, timeout is 15s on API side).
+	// It starts first: on an empty volume the first version listing clones
+	// RustDesk, which can take a long time, and the API must keep seeing the
+	// worker meanwhile.
 	go w.heartbeatLoop(ctx)
 
-	// 4. Start version refresh goroutine (every 5 minutes)
+	// 3. Push versions now (cloning on first use), then every 5 minutes
 	go w.versionPushLoop(ctx)
 
 	// 5. Polling loop
@@ -88,6 +85,7 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 }
 
 func (w *Worker) versionPushLoop(ctx context.Context) {
+	w.pushVersions()
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -95,13 +93,21 @@ func (w *Worker) versionPushLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if versions, err := w.preBuilder.ListVersions(); err == nil {
-				if err := w.apiClient.PushVersions(w.cfg.Worker.Name, versions); err != nil {
-					log.Printf("Warning: failed to push versions: %v", err)
-				}
-			}
+			w.pushVersions()
 		}
 	}
+}
+
+func (w *Worker) pushVersions() {
+	versions, err := w.preBuilder.ListVersions()
+	if err != nil || len(versions) == 0 {
+		return
+	}
+	if err := w.apiClient.PushVersions(w.cfg.Worker.Name, versions); err != nil {
+		log.Printf("Warning: failed to push versions: %v", err)
+		return
+	}
+	log.Printf("Pushed %d versions", len(versions))
 }
 
 func (w *Worker) pollLoop(ctx context.Context) {
@@ -220,38 +226,28 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 
 	pubKey := w.cfg.Build.SigningPublicKey
 
-	// Start streaming log before build begins — the builder writes to logDir
-	// We'll figure out the log path after build, but we can predict it from the builder's pattern
-	// Instead, start streaming after build starts (builder creates the file immediately)
-	// We use a channel: build runs synchronously, log streams in background
-
-	// Build runs synchronously — log file is created at the start of Build()
-	// We need the log path first. The builder creates it deterministically.
-	// Approach: start build, then stream. But build is blocking.
-	// Better: run build in goroutine, stream from known log dir.
-
-	// Run build in a goroutine so we can stream logs concurrently
+	// Run the build in a goroutine so its log can be streamed meanwhile. Build
+	// reports its own log path once the file exists; guessing from the log
+	// dir picked another version's log once several had accumulated.
 	type buildResult struct {
 		result *builder.BuildResult
 		err    error
 	}
 	resultCh := make(chan buildResult, 1)
+	logCh := make(chan string, 1)
 	go func() {
-		r, err := w.preBuilder.Build(job.Version, job.Platform, job.Arch, pubKey)
+		r, err := w.preBuilder.Build(job.Version, job.Platform, job.Arch, pubKey, func(p string) { logCh <- p })
 		resultCh <- buildResult{r, err}
 	}()
 
-	// Wait briefly for the log file to be created, then start streaming
+	// A build that fails before creating its log has nothing to stream.
 	var logPath string
-	time.Sleep(500 * time.Millisecond)
-	// Find the most recent log file in the log dir
-	entries, _ := os.ReadDir(w.cfg.Build.LogDir)
-	for i := len(entries) - 1; i >= 0; i-- {
-		name := entries[i].Name()
-		if strings.HasPrefix(name, "prebuild_") && strings.HasSuffix(name, ".log") {
-			logPath = filepath.Join(w.cfg.Build.LogDir, name)
-			break
-		}
+	var br buildResult
+	finished := false
+	select {
+	case logPath = <-logCh:
+	case br = <-resultCh:
+		finished = true
 	}
 
 	var stopStream context.CancelFunc
@@ -261,19 +257,20 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 	}
 
 	// Wait for build to complete or cancellation
-	var br buildResult
-	select {
-	case br = <-resultCh:
-		// Build finished normally
-	case <-cancelledCh:
-		// Job was cancelled — kill the build process
-		log.Printf("Job %d cancelled by user, aborting build", job.ID)
-		w.preBuilder.Cancel()
-		<-resultCh // wait for build goroutine to exit
-		if stopStream != nil {
-			stopStream()
+	if !finished {
+		select {
+		case br = <-resultCh:
+			// Build finished normally
+		case <-cancelledCh:
+			// Job was cancelled — kill the build process
+			log.Printf("Job %d cancelled by user, aborting build", job.ID)
+			w.preBuilder.Cancel()
+			<-resultCh // wait for build goroutine to exit
+			if stopStream != nil {
+				stopStream()
+			}
+			return
 		}
-		return
 	}
 
 	// Stop streaming (final flush)

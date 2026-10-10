@@ -223,38 +223,28 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 
 	pubKey := w.cfg.Build.SigningPublicKey
 
-	// Start streaming log before build begins — the builder writes to logDir
-	// We'll figure out the log path after build, but we can predict it from the builder's pattern
-	// Instead, start streaming after build starts (builder creates the file immediately)
-	// We use a channel: build runs synchronously, log streams in background
-
-	// Build runs synchronously — log file is created at the start of Build()
-	// We need the log path first. The builder creates it deterministically.
-	// Approach: start build, then stream. But build is blocking.
-	// Better: run build in goroutine, stream from known log dir.
-
-	// Run build in a goroutine so we can stream logs concurrently
+	// Run the build in a goroutine so its log can be streamed meanwhile. Build
+	// reports its own log path once the file exists; guessing from the log
+	// dir picked another version's log once several had accumulated.
 	type buildResult struct {
 		result *builder.BuildResult
 		err    error
 	}
 	resultCh := make(chan buildResult, 1)
+	logCh := make(chan string, 1)
 	go func() {
-		r, err := w.preBuilder.Build(job.Version, job.Platform, job.Arch, pubKey)
+		r, err := w.preBuilder.Build(job.Version, job.Platform, job.Arch, pubKey, func(p string) { logCh <- p })
 		resultCh <- buildResult{r, err}
 	}()
 
-	// Wait briefly for the log file to be created, then start streaming
+	// A build that fails before creating its log has nothing to stream.
 	var logPath string
-	time.Sleep(500 * time.Millisecond)
-	// Find the most recent log file in the log dir
-	entries, _ := os.ReadDir(w.cfg.Build.LogDir)
-	for i := len(entries) - 1; i >= 0; i-- {
-		name := entries[i].Name()
-		if strings.HasPrefix(name, "prebuild_") && strings.HasSuffix(name, ".log") {
-			logPath = filepath.Join(w.cfg.Build.LogDir, name)
-			break
-		}
+	var br buildResult
+	finished := false
+	select {
+	case logPath = <-logCh:
+	case br = <-resultCh:
+		finished = true
 	}
 
 	var stopStream context.CancelFunc
@@ -264,19 +254,20 @@ func (w *Worker) handlePreBuild(job *api.WorkerJob) {
 	}
 
 	// Wait for build to complete or cancellation
-	var br buildResult
-	select {
-	case br = <-resultCh:
-		// Build finished normally
-	case <-cancelledCh:
-		// Job was cancelled — kill the build process
-		log.Printf("Job %d cancelled by user, aborting build", job.ID)
-		w.preBuilder.Cancel()
-		<-resultCh // wait for build goroutine to exit
-		if stopStream != nil {
-			stopStream()
+	if !finished {
+		select {
+		case br = <-resultCh:
+			// Build finished normally
+		case <-cancelledCh:
+			// Job was cancelled — kill the build process
+			log.Printf("Job %d cancelled by user, aborting build", job.ID)
+			w.preBuilder.Cancel()
+			<-resultCh // wait for build goroutine to exit
+			if stopStream != nil {
+				stopStream()
+			}
+			return
 		}
-		return
 	}
 
 	// Stop streaming (final flush)

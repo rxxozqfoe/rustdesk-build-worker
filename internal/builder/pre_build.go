@@ -151,7 +151,9 @@ func (b *PreBuilder) ListVersions() ([]string, error) {
 }
 
 // Build executes the full build pipeline and returns the output directory.
-func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult, error) {
+// onLog, when set, receives the path of this build's log as soon as the file
+// exists, so the caller can stream it while the build runs.
+func (b *PreBuilder) Build(version, platform, arch, pubKey string, onLog func(logPath string)) (*BuildResult, error) {
 	if platform != "linux" {
 		return nil, fmt.Errorf("only linux platform is supported for builds")
 	}
@@ -174,6 +176,9 @@ func (b *PreBuilder) Build(version, platform, arch, pubKey string) (*BuildResult
 		return nil, fmt.Errorf("failed to create log file: %v", err)
 	}
 	defer func() { _ = logFile.Close() }()
+	if onLog != nil {
+		onLog(logPath)
+	}
 
 	logger := bufio.NewWriter(logFile)
 	writeLog := func(format string, args ...any) {

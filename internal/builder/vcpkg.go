@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 var commitRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -40,11 +42,18 @@ func vcpkgBaseline(srcDir string) (string, error) {
 	return baseline, nil
 }
 
-// removeStaleLock deletes the index.lock a killed git process (say, a pod
-// restarted mid-checkout) leaves behind. Callers hold gitMu and the worker
-// runs one build at a time, so no live git process can own it.
-func removeStaleLock(repoDir string) {
-	_ = os.Remove(filepath.Join(repoDir, ".git", "index.lock"))
+// removeStaleLocks deletes every *.lock under repoDir/.git, submodules
+// included: index, HEAD, ref and packed-refs locks that a killed git process
+// (say, a pod restarted mid-fetch or mid-checkout) leaves behind and that
+// would fail every later git command. Callers hold gitMu and the worker runs
+// one build at a time, so no live git process can own them.
+func removeStaleLocks(repoDir string) {
+	_ = filepath.WalkDir(filepath.Join(repoDir, ".git"), func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".lock") {
+			_ = os.Remove(path)
+		}
+		return nil
+	})
 }
 
 // prepareVcpkg brings the worker's vcpkg clone to the baseline the release in
@@ -88,7 +97,7 @@ func (b *PreBuilder) syncVcpkg(vcpkgDir, baseline string, logFile io.Writer) err
 			return fmt.Errorf("vcpkg clone %s failed: %w", redactURL(b.vcpkgRepoURL), err)
 		}
 	}
-	removeStaleLock(vcpkgDir)
+	removeStaleLocks(vcpkgDir)
 	if err := b.runInDir(vcpkgDir, nil, "git", "cat-file", "-e", baseline+"^{commit}"); err != nil {
 		if err := runGitRemote(b.vcpkgRepoURL, vcpkgDir, logFile, "fetch", "origin"); err != nil {
 			return fmt.Errorf("vcpkg fetch failed: %w", err)

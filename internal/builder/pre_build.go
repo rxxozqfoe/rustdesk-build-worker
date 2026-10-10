@@ -115,6 +115,7 @@ func (b *PreBuilder) syncSource(logWriter io.Writer) error {
 		}
 		return nil
 	}
+	removeStaleLocks(srcDir)
 	if err := runGitRemote(b.repoURL, srcDir, logWriter, "fetch", "origin", "--tags", "--force"); err != nil {
 		return fmt.Errorf("git fetch failed: %w", err)
 	}
@@ -304,7 +305,6 @@ func (b *PreBuilder) checkout(version string, logFile io.Writer) error {
 	if err := b.syncSource(logFile); err != nil {
 		return err
 	}
-	removeStaleLock(srcDir)
 	if err := b.runInDir(srcDir, logFile, "git", "checkout", "--force", version); err != nil {
 		return fmt.Errorf("git checkout %s failed: %v", version, err)
 	}

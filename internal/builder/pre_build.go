@@ -131,8 +131,10 @@ func (b *PreBuilder) syncSource(logWriter io.Writer) error {
 func (b *PreBuilder) ListVersions() ([]string, error) {
 	srcDir, _ := filepath.Abs(b.srcDir)
 
+	// git's (redacted) output goes to the worker log, so a failed first
+	// clone says why.
 	b.gitMu.Lock()
-	err := b.syncSource(nil)
+	err := b.syncSource(log.Writer())
 	b.gitMu.Unlock()
 	if err != nil {
 		log.Printf("Warning: syncing %s: %v", srcDir, err)

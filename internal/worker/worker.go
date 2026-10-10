@@ -55,19 +55,13 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 	log.Printf("Registered as %q with platforms: %v", w.cfg.Worker.Name, w.cfg.Worker.Platforms)
 
-	// 2. Push initial versions
-	if versions, err := w.preBuilder.ListVersions(); err == nil && len(versions) > 0 {
-		if err := w.apiClient.PushVersions(w.cfg.Worker.Name, versions); err != nil {
-			log.Printf("Warning: failed to push versions: %v", err)
-		} else {
-			log.Printf("Pushed %d versions", len(versions))
-		}
-	}
-
-	// 3. Start heartbeat goroutine (every 5s, timeout is 15s on API side)
+	// 2. Start heartbeat goroutine (every 5s, timeout is 15s on API side).
+	// It starts first: on an empty volume the first version listing clones
+	// RustDesk, which can take a long time, and the API must keep seeing the
+	// worker meanwhile.
 	go w.heartbeatLoop(ctx)
 
-	// 4. Start version refresh goroutine (every 5 minutes)
+	// 3. Push versions now (cloning on first use), then every 5 minutes
 	go w.versionPushLoop(ctx)
 
 	// 5. Polling loop
@@ -91,6 +85,7 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 }
 
 func (w *Worker) versionPushLoop(ctx context.Context) {
+	w.pushVersions()
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -98,13 +93,21 @@ func (w *Worker) versionPushLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if versions, err := w.preBuilder.ListVersions(); err == nil {
-				if err := w.apiClient.PushVersions(w.cfg.Worker.Name, versions); err != nil {
-					log.Printf("Warning: failed to push versions: %v", err)
-				}
-			}
+			w.pushVersions()
 		}
 	}
+}
+
+func (w *Worker) pushVersions() {
+	versions, err := w.preBuilder.ListVersions()
+	if err != nil || len(versions) == 0 {
+		return
+	}
+	if err := w.apiClient.PushVersions(w.cfg.Worker.Name, versions); err != nil {
+		log.Printf("Warning: failed to push versions: %v", err)
+		return
+	}
+	log.Printf("Pushed %d versions", len(versions))
 }
 
 func (w *Worker) pollLoop(ctx context.Context) {

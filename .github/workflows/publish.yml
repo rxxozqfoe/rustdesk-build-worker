@@ -324,9 +324,10 @@ jobs:
             --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/publish.yml"
 
   # -------------------------------------------------------------------
-  # Builder image (Dockerfile.builder): amd64 only, pushed as
-  # <version>-builder, then signed and attested like the slim image and
-  # smoke-tested for the toolchain the worker shells out to.
+  # Builder image (Dockerfile.builder): amd64 only. Built and smoke-tested
+  # locally first, so a broken toolchain never reaches the registry; then
+  # pushed as <version>-builder (from the same build cache), signed and
+  # attested like the slim image.
   # -------------------------------------------------------------------
   build-builder:
     name: Build, sign and attest builder image
@@ -367,6 +368,25 @@ jobs:
           flavor: |
             latest=false
 
+      - name: Build locally for the smoke test
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: ./Dockerfile.builder
+          platforms: linux/amd64
+          load: true
+          tags: local/builder-smoke:${{ github.sha }}
+          cache-from: type=gha,scope=builder
+
+      - name: Smoke test the toolchain
+        env:
+          IMAGE: local/builder-smoke:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint bash "$IMAGE" -c \
+            'cargo --version && rustc --version && rustfmt --version && flutter --version && flutter_rust_bridge_codegen --version && /app/build-worker --help > /dev/null && test "$(id -u)" = 65532'
+          docker image rm "$IMAGE"
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
@@ -397,14 +417,6 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
-
-      - name: Smoke test the toolchain
-        env:
-          IMAGE_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          docker run --rm --entrypoint bash "$IMAGE_DIGEST_REF" -c \
-            'cargo --version && rustc --version && rustfmt --version && flutter --version && flutter_rust_bridge_codegen --version && /app/build-worker --help > /dev/null && test "$(id -u)" = 65532'
 
   verify-builder:
     name: Verify builder signature and provenance

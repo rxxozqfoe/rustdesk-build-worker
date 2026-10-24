@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # NOT baked in; it is expected to be provided by the runtime environment
 # (mounted onto the host, or layered into a derived image). See the PR
 # description for the runtime-toolchain caveat.
-FROM cgr.dev/chainguard/wolfi-base@sha256:05d24163df148be377275af8374c16523a1dc7e19bf4f1c689784791553c5e45
+FROM cgr.dev/chainguard/wolfi-base@sha256:360896efb0753a5701c48f860e17130c205eae5a264797aa3e7ea126ee2923a7
 
 WORKDIR /app
 
